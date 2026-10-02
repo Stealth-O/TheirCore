@@ -577,12 +577,12 @@ struct TheirCoreTestingTests {
             ) {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
-            Issue.record("Expected stress timeout.")
+            Issue.record("Expected Their.stress timeout.")
         } catch let error as Their.StressTimeoutError {
             #expect(error.iteration == 0)
             #expect(error.timeout == .milliseconds(1))
         } catch {
-            Issue.record("Expected StressTimeoutError, got \(error).")
+            Issue.record("Expected Their.StressTimeoutError, got \(error).")
         }
     }
 
@@ -618,12 +618,12 @@ struct TheirCoreTestingTests {
                         throw error
                     }
                 }
-                Issue.record("Expected stress timeout.")
+                Issue.record("Expected Their.stress timeout.")
                 return nil
             } catch let error as Their.StressTimeoutError {
                 return error
             } catch {
-                Issue.record("Expected StressTimeoutError, got \(error).")
+                Issue.record("Expected Their.StressTimeoutError, got \(error).")
                 return nil
             }
         }
@@ -696,6 +696,72 @@ struct TheirCoreTestingTests {
             cancel()
             #expect(recorder.cancelCallsCount == 1)
             #expect(recorder.startCallsCount == 1)
+        }
+    }
+
+    @Test func testWorkRecorderReplacedReportCaptureCanReenterRecorder() async throws {
+        try await Their.stress {
+            let deinitializations = Their.TestCountRecorder()
+            let events = Their.TestEventRecorder<Their.WorkOutput<Int, TheirCoreTestingTestsError>>()
+            let observedStarts = Their.TestEventRecorder<Int>()
+            let recorder = Their.TestWorkRecorder<Int, TheirCoreTestingTestsError>()
+            let installReport: @Sendable () -> Their.WorkCancel = {
+                let capture = TheirCoreTestingReportLifetimeCapture { [weak recorder] in
+                    _ = deinitializations.increment()
+                    guard let recorder, recorder.isLockAvailableForTests() else {
+                        Issue.record("Expected report destruction outside the recorder lock.")
+                        return
+                    }
+                    observedStarts.append(recorder.startCallsCount)
+                    recorder.emit(.value(7))
+                }
+                return recorder.work { [capture] _ in
+                    withExtendedLifetime(capture) {}
+                }
+            }
+
+            let firstCancel = installReport()
+            let secondCancel = recorder.work(report: events.append(_:))
+
+            #expect(deinitializations.count == 1)
+            #expect(observedStarts.events == [2])
+            #expect(events.events == [.value(7)])
+
+            firstCancel()
+            secondCancel()
+            #expect(recorder.cancelCallsCount == 2)
+        }
+    }
+
+    @Test func testWorkRecorderReplacedReportCaptureIsReleasedOutsideLock() async throws {
+        try await Their.stress {
+            let deinitializations = Their.TestCountRecorder()
+            let lockObservations = Their.TestEventRecorder<Bool>()
+            let recorder = Their.TestWorkRecorder<Int, TheirCoreTestingTestsError>()
+            let isRecorderLockAvailable: @Sendable () -> Bool = { [weak recorder] in
+                recorder?.isLockAvailableForTests() ?? false
+            }
+            let installReport: @Sendable () -> Their.WorkCancel = {
+                let capture = TheirCoreTestingReportLifetimeCapture {
+                    lockObservations.append(isRecorderLockAvailable())
+                    _ = deinitializations.increment()
+                }
+                return recorder.work { [capture] _ in
+                    withExtendedLifetime(capture) {}
+                }
+            }
+
+            let firstCancel = installReport()
+            #expect(deinitializations.count == 0)
+            let secondCancel = recorder.work { _ in }
+
+            #expect(deinitializations.count == 1)
+            #expect(lockObservations.events == [true])
+            #expect(recorder.startCallsCount == 2)
+
+            firstCancel()
+            secondCancel()
+            #expect(recorder.cancelCallsCount == 2)
         }
     }
 
@@ -907,6 +973,19 @@ private actor TheirCoreTestingUncancellableGate {
             }
             continuations.append(continuation)
         }
+    }
+}
+
+private final class TheirCoreTestingReportLifetimeCapture: Sendable {
+
+    private let onDeinit: @Sendable () -> Void
+
+    init(onDeinit: @escaping @Sendable () -> Void) {
+        self.onDeinit = onDeinit
+    }
+
+    deinit {
+        onDeinit()
     }
 }
 

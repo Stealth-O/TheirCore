@@ -147,6 +147,10 @@ extension Optional where Wrapped == Their.LifecycleLogging {
 #if DEBUG
 extension Their.LifecycleLogging {
 
+    static func isStoreLockAvailableForTests() -> Bool {
+        LifecycleLoggingStore.shared.isLockAvailableForTests()
+    }
+
     static func resetForTests() {
         LifecycleLoggingStore.shared.reset()
     }
@@ -216,6 +220,10 @@ private final class LifecycleLoggingStore: Sendable {
         }
     }
 
+    func isLockAvailableForTests() -> Bool {
+        state.withLockIfAvailable { _ in true } ?? false
+    }
+
     func log(
         event rawEvent: String,
         logging: Their.LifecycleLogging
@@ -249,21 +257,28 @@ private final class LifecycleLoggingStore: Sendable {
     }
 
     func reset() {
-        state.withLock { state in
+        let oldOutput = state.withLock { state in
             // A reset can be requested reentrantly by the current output sink.
             // Keep the queued lines and drainer ownership intact so no line is
             // dropped and no second drainer can overtake the first one.
+            let oldOutput = state.output
             state.counts = [:]
             state.output = { line in
                 print(line)
             }
+            return oldOutput
         }
+        withExtendedLifetime(oldOutput) {}
     }
 
     func setOutput(_ output: @escaping @Sendable (String) -> Void) {
-        state.withLock { state in
+        let oldOutput = state.withLock { state in
+            let oldOutput = state.output
             state.output = output
+            return oldOutput
         }
+        // A sink capture's destructor may log or replace the output again.
+        withExtendedLifetime(oldOutput) {}
     }
 }
 

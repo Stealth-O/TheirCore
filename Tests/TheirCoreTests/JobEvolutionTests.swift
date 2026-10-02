@@ -7,6 +7,54 @@ import TheirCoreTesting
 @Suite
 struct JobEvolutionTests {
 
+    /// The mapper holds the drainer on a Dispatch worker. Cancellation finishes
+    /// before it returns, so its mapped failure must not start a sink callback
+    /// after cancellation. No executor timing or sleeps decide the ordering.
+    @Test func evolveCancelDuringFailureMapperSuppressesTerminalCallback() async throws {
+        try await Their.stress(count: 1) {
+            let mapperCalls = Their.TestCountRecorder()
+            let mapperEntered = JobEvolutionTestSignal()
+            let releaseMapper = DispatchSemaphore(value: 0)
+            let eventRecorder = JobEvolutionOtherEventRecorder<Int>()
+            let upstream = JobEvolutionJobDriver()
+            let evolved = upstream.job.mapError { failure in
+                _ = mapperCalls.increment()
+                mapperEntered.signal()
+                releaseMapper.wait()
+                return JobEvolutionOtherTestsError.wrapped(failure)
+            }
+            let cancel = evolved.subscribe(eventRecorder.append(_:))
+            defer {
+                releaseMapper.signal()
+                cancel()
+            }
+            let emitWork = BlockingWork {
+                upstream.emit(failure: .sample)
+            }
+            do {
+                try await mapperEntered.wait()
+
+                cancel()
+                #expect(eventRecorder.events.isEmpty == true)
+                releaseMapper.signal()
+                try await emitWork.value
+            } catch {
+                releaseMapper.signal()
+                // An unstructured task does not inherit this body's cancelled
+                // status, so the Dispatch worker is joined even on timeout.
+                let cleanup = Task {
+                    try await emitWork.value
+                }
+                _ = await cleanup.result
+                throw error
+            }
+
+            #expect(mapperCalls.count == 1)
+            #expect(eventRecorder.events.isEmpty == true)
+            #expect(upstream.cancelCallsCount == 1)
+        }
+    }
+
     @Test func evolveCancelsUpstreamAndSuppressesLateFailureWhenSubscriptionCancels() async throws {
         try await Their.stress {
             let eventRecorder = JobEvolutionEventRecorder<Int>()
@@ -180,6 +228,41 @@ struct JobEvolutionTests {
         }
     }
 
+
+    /// A failure mapper is user code, like the value transform. Cancelling the
+    /// subscription inside it must suppress the terminal callback that has not
+    /// started yet, even though the upstream itself is already terminated.
+    @Test func evolveFailureMapperReentrantCancelSuppressesTerminalCallback() async throws {
+        try await Their.stress {
+            let cancelBox = Their.Lock<Their.WorkCancel?>(nil)
+            let mapperCalls = Their.TestCountRecorder()
+            let eventRecorder = JobEvolutionOtherEventRecorder<Int>()
+            let upstream = JobEvolutionJobDriver()
+            let evolved = upstream.job.mapError { failure in
+                _ = mapperCalls.increment()
+                cancelBox.withLock { $0 }?()
+                return JobEvolutionOtherTestsError.wrapped(failure)
+            }
+            let cancel = evolved.subscribe(eventRecorder.append(_:))
+            cancelBox.withLock { $0 = cancel }
+            defer {
+                let detached = cancelBox.withLock { stored in
+                    let detached = stored
+                    stored = nil
+                    return detached
+                }
+                withExtendedLifetime(detached) {}
+                cancel()
+            }
+
+            upstream.emit(failure: .sample)
+
+            #expect(mapperCalls.count == 1)
+            #expect(eventRecorder.events.isEmpty == true)
+            #expect(upstream.cancelCallsCount == 1)
+        }
+    }
+
     /// Pins the FIFO ordering of terminal failure behind a blocked transform:
     /// the failure is processed by the same single drainer, so it cannot
     /// overtake or interrupt the value being transformed — the value is
@@ -215,6 +298,75 @@ struct JobEvolutionTests {
             #expect(eventRecorder.events == [.value(1), .failure(.sample)])
             #expect(workRecorder.cancelCallsCount == 1)
             #expect(workRecorder.startCallsCount == 1)
+        }
+    }
+
+    /// The upstream cancel returns while the failure mapper still holds the
+    /// terminating lifecycle. It must be invoked immediately, without clearing
+    /// the pending terminal or leaving an owned cancel behind after delivery.
+    @Test func evolveLateReturnedCancelDuringFailureMapperIsCancelledOnce() async throws {
+        try await Their.stress(count: 1) {
+            let eventRecorder = JobEvolutionOtherEventRecorder<Int>()
+            let mapperCalls = Their.TestCountRecorder()
+            let mapperEntered = DispatchSemaphore(value: 0)
+            let mapperRelease = DispatchSemaphore(value: 0)
+            let reportWorkSlot = Their.Lock<BlockingWork<Void>?>(nil)
+            let workRecorder = JobEvolutionWorkRecorder()
+            defer {
+                mapperEntered.signal()
+                mapperRelease.signal()
+            }
+            let upstream = Their.Job { report in
+                let cancel = workRecorder.work(report: report)
+                let reportWork = BlockingWork {
+                    report(.failure(.sample))
+                }
+                reportWorkSlot.withLock { $0 = reportWork }
+                mapperEntered.wait()
+                return cancel
+            }
+            let evolved = upstream.mapError { failure in
+                _ = mapperCalls.increment()
+                mapperEntered.signal()
+                mapperRelease.wait()
+                return JobEvolutionOtherTestsError.wrapped(failure)
+            }
+            let subscribeWork = BlockingWork {
+                evolved.subscribe(eventRecorder.append(_:))
+            }
+            do {
+                let cancel = try await subscribeWork.value
+                defer { cancel() }
+                let reportWork = try #require(reportWorkSlot.withLock { $0 })
+                let cancelsBeforeMapperReturns = workRecorder.cancelCallsCount
+                let eventsBeforeMapperReturns = eventRecorder.events
+
+                mapperRelease.signal()
+                try await reportWork.value
+                cancel()
+                cancel()
+
+                #expect(cancelsBeforeMapperReturns == 1)
+                #expect(eventsBeforeMapperReturns.isEmpty == true)
+                #expect(mapperCalls.count == 1)
+                #expect(eventRecorder.events == [.failure(.wrapped(.sample))])
+                #expect(workRecorder.startCallsCount == 1)
+                #expect(workRecorder.cancelCallsCount == 1)
+            } catch {
+                mapperEntered.signal()
+                mapperRelease.signal()
+                // Join both Dispatch workers from a task that does not inherit
+                // cancellation of the timed-out scenario.
+                let cleanup = Task {
+                    let cancel = try await subscribeWork.value
+                    cancel()
+                    if let reportWork = reportWorkSlot.withLock({ $0 }) {
+                        try await reportWork.value
+                    }
+                }
+                _ = await cleanup.result
+                throw error
+            }
         }
     }
 
@@ -567,6 +719,7 @@ struct JobEvolutionTests {
         }
     }
 
+
     @Test func mapErrorTransformsFailureAndPropagatesValue() async throws {
         try await Their.stress {
             let eventRecorder = JobEvolutionOtherEventRecorder<Int>()
@@ -634,6 +787,7 @@ struct JobEvolutionTests {
             #expect(workRecorder.startCallsCount == 1)
         }
     }
+
 }
 
 private enum JobEvolutionTestsError: Equatable, Swift.Error, Sendable {

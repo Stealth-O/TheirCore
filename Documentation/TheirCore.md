@@ -77,6 +77,10 @@ The behavioral contracts live on the types, so this document only points at them
 
 Usage guidance: treat `evolve` as the default shape for pure event-to-state logic, and keep side effects such as SDK calls, persistence or cancelling other resources outside the transform, in a thin `Their.Work` or runner layer. If a restartable subscription is needed, add a wrapper that builds a fresh `Their.Job` per lifecycle instead of weakening the one-lifecycle contract.
 
+Terminal delivery has a separate claim. Job evolution and merge first close inputs and enter an internal `terminating` phase, retaining a cancellable terminal sink. Failure mapping and teardown through already-stored cancels run outside the lock before that sink is claimed. Cancellation during that work clears the pending sink and suppresses delivery. A sink already claimed has the normal in-flight callback contract: cancellation does not interrupt it.
+
+`tryMap` and `merge` do not wait for an upstream subscription still returning its cancel. A synchronous or concurrent terminal can be delivered first, and the late-returned cancel is then invoked exactly once. Merge marks failure when it is enqueued, so later sources are not started even if an earlier value still holds the drainer. The current source's returned cancel is invoked immediately in that case, while values queued before the failure keep their FIFO order.
+
 ## Hub Model
 
 `Their.Hub` is the shared, multi-subscriber peer of `Their.Job`: one shared lifecycle that many subscribers join. `HubEngine` is its internal engine. Both are plain `final class: Sendable` types. TheirCore uses no actors for jobs and hubs; all synchronization goes through `Their.Lock`. A hub is intentionally different from a job, which is single-lifecycle and single-subscriber.
@@ -189,7 +193,11 @@ A scenario that holds a drainer inside a sink or transform, for example with a `
 
 ### Lifetime Cleanup Contract
 
-The cleanup paths covered here are subscription pins and sink slots, `JobEngine` input cleanup, job evolution, hub evolution and merge. They detach retired callbacks, state and discarded inputs under the corresponding lock, then release those references after unlocking, so destructors may synchronously re-enter cancellation. Releasing the last facade reference of a job or hub subscription pin must not run upstream teardown under the pin lock.
+The cleanup paths covered here are subscription pins and sink slots, `JobEngine` input cleanup, job evolution, hub evolution, merge, weak-cache pruning and replacement of logging outputs and diagnostic hooks. They detach retired callbacks, state and discarded inputs under the corresponding lock, then release those references after unlocking, so destructors may synchronously re-enter cancellation or lookup. Releasing the last facade reference of a job or hub subscription pin must not run upstream teardown under the pin lock.
+
+A job's sink slot moves through `open`, `subscribed` and `closed`. Taking or clearing it closes the slot permanently before root-engine teardown. A destructor may attempt to subscribe again through a nonfatal misuse handler, but the rejected subscription never acquires a sink.
+
+Weak-cache pruning retains retired keys and temporary strong reads of weak values through unlock. A destructor can then look up the newly inserted entry without recursively acquiring the cache lock. The `orInsert` factory still runs under that lock and must not reenter the cache. Replacing a logging output or hub diagnostic hook follows the same post-lock capture-release rule.
 
 A hub subscription drops its sink reference on cancel, finish or failure. Keeping an inert cancel handle does not keep sink captures alive. A callback or transform already in flight may retain its own snapshot until it returns; cancellation does not interrupt it or wait for SDK-owned asynchronous teardown. Repeated cancellation stays safe, and terminal and value FIFO ordering and generation fencing are preserved.
 
@@ -201,6 +209,10 @@ Regression coverage:
 - `JobEvolutionLifetimeTests`, `HubEvolutionLifetimeTests` and `JobMergeLifetimeTests`: destructors of state, replay values, sinks and discarded inputs across cancel, finish, failure, transform failure, unsubscribing a subscriber that is not the last, replacement and reentrant cleanup. DEBUG-only construction seams use the actual private state machines without exposing public facade state.
 - `HubCaptureLifetimeTests` and `HubEngineSubscriptionTests`: captures released while the cancel handle remains alive, terminal cleanup, callback-driven cancellation, and captures retained only until an in-flight callback returns.
 - `InputQueueTests` and `JobEngineLifetimeTests`: ownership of consumed payloads through compaction, including optional nil values, discarded and ignored inputs, and destructor reentry into stop and terminate.
+- `JobTests`, `JobEvolutionTests`, `JobTryMapTests` and `JobMergeTests`: rejected reentrant subscription, cancellation during terminal mapping or teardown, queued-failure source fencing, and terminal delivery before a late-returned cancel.
+- `WeakValueCacheTests`, `LifecycleLoggingTests` and `HubEngineTests`: retired-key lookup, capture destruction after unlock and cancellation-aware diagnostic state waits. `LockTests` checks that the nonblocking lock probe is safe from the thread already holding the lock.
+
+`HubEngine.waitForStateForTests` is internal and DEBUG-only. Cancellation silently completes the wait and removes its UUID registration even if the engine stays idle. State satisfaction and cancellation settle the same registration once under the lifecycle lock and resume its continuation after unlocking.
 
 Weak lifetime observations in these regressions use `@Sendable` closures with weak captures that return only a Boolean. This keeps observation non-owning without mutable weak locals in assertion macros or artificial writes to silence compiler warnings; deinit counters remain independent checks of cleanup.
 

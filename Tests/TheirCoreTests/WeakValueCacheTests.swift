@@ -141,6 +141,94 @@ struct WeakValueCacheTests {
         }
     }
 
+    /// A stale key's destructor performs a real lookup of the entry whose miss
+    /// triggered pruning. The nonblocking probe prevents a regressed held lock
+    /// from trapping the runner before its failed assertion can be reported.
+    @Test func pruningAllowsDeadEntryKeyDestructorToReadInsertedValue() async throws {
+        try await Their.stress {
+            let cache = Their.WeakValueCache<WeakValueCacheTestKey, WeakValueCacheTestObject>()
+            let deinitializations = Their.TestCountRecorder()
+            let factoryCalls = Their.TestCountRecorder()
+            let isCacheLockAvailable = cache.lockAvailabilityProbeForTests()
+            let lockObservations = Their.TestEventRecorder<Bool>()
+            let lookupReturns = Their.TestCountRecorder()
+            let lookedUpValues = Their.TestEventRecorder<WeakValueCacheTestObject>()
+            let newKey = WeakValueCacheTestKey(id: 2)
+            let insertDeadEntry: @Sendable () -> Void = {
+                let key = WeakValueCacheTestKey(id: 1) {
+                    _ = deinitializations.increment()
+                    let isAvailable = isCacheLockAvailable()
+                    lockObservations.append(isAvailable)
+                    guard isAvailable else {
+                        return
+                    }
+                    let value = cache.value(forKey: newKey) {
+                        _ = factoryCalls.increment()
+                        return WeakValueCacheTestObject()
+                    }
+                    lookedUpValues.append(value)
+                    _ = lookupReturns.increment()
+                }
+                let value = cache.value(forKey: key) {
+                    WeakValueCacheTestObject()
+                }
+                withExtendedLifetime(value) {}
+            }
+
+            insertDeadEntry()
+            #expect(deinitializations.count == 0)
+
+            let insertedValue = cache.value(forKey: newKey) {
+                _ = factoryCalls.increment()
+                return WeakValueCacheTestObject()
+            }
+
+            #expect(deinitializations.count == 1)
+            #expect(lockObservations.events == [true])
+            #expect(lookupReturns.count == 1)
+            #expect(factoryCalls.count == 1)
+            #expect(lookedUpValues.events.count == 1)
+            #expect(lookedUpValues.events.first === insertedValue)
+            #expect(isCacheLockAvailable())
+        }
+    }
+
+    @Test func pruningReleasesDeadEntryKeyOutsideCacheLock() async throws {
+        try await Their.stress {
+            let cache = Their.WeakValueCache<WeakValueCacheTestKey, WeakValueCacheTestObject>()
+            let deinitializations = Their.TestCountRecorder()
+            let isCacheLockAvailable = cache.lockAvailabilityProbeForTests()
+            let lockObservations = Their.TestEventRecorder<Bool>()
+            let insertDeadEntry: @Sendable () -> Void = {
+                let key = WeakValueCacheTestKey(id: 1) {
+                    lockObservations.append(isCacheLockAvailable())
+                    _ = deinitializations.increment()
+                }
+                let value = cache.value(forKey: key) {
+                    WeakValueCacheTestObject()
+                }
+                withExtendedLifetime(value) {}
+            }
+
+            // The helper returns with no external owner of its key or value.
+            // Only the cache owns the stale key; its observer holds no cache pin.
+            insertDeadEntry()
+            #expect(deinitializations.count == 0)
+            #expect(lockObservations.events.isEmpty)
+            #expect(isCacheLockAvailable())
+
+            let otherKey = WeakValueCacheTestKey(id: 2)
+            let otherValue = cache.value(forKey: otherKey) {
+                WeakValueCacheTestObject()
+            }
+
+            #expect(deinitializations.count == 1)
+            #expect(lockObservations.events == [true])
+            #expect(isCacheLockAvailable())
+            withExtendedLifetime(otherValue) {}
+        }
+    }
+
     @Test func pruningRemovesDeadEntriesWhileKeepingLiveOnes() async throws {
         try await Their.stress {
             let cache = Their.WeakValueCache<String, WeakValueCacheTestObject>()
@@ -246,5 +334,31 @@ struct WeakValueCacheTests {
 }
 
 private enum WeakValueCacheTestsError: Equatable, Swift.Error, Sendable {}
+
+private final class WeakValueCacheTestKey: Hashable, Sendable {
+
+    private let id: Int
+    private let onDeinit: @Sendable () -> Void
+
+    init(
+        id: Int,
+        onDeinit: @escaping @Sendable () -> Void = {}
+    ) {
+        self.id = id
+        self.onDeinit = onDeinit
+    }
+
+    deinit {
+        onDeinit()
+    }
+
+    static func == (lhs: WeakValueCacheTestKey, rhs: WeakValueCacheTestKey) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+}
 
 private final class WeakValueCacheTestObject: Sendable {}

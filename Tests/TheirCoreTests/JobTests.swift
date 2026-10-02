@@ -7,6 +7,68 @@ import TheirCoreTesting
 @Suite
 struct JobTests {
 
+    /// Releasing the original sink may synchronously attempt a new subscription.
+    /// Reports from a nonfatal rejection handler must never reach that rejected
+    /// sink, even while the original cancellation is still unwinding.
+    @Test(arguments: [Their.WorkOutput<Int, JobTestsError>.finished, .failure(.sample), .value(99)])
+    private func cancelRejectsReentrantSubscriptionWithoutDeliveringMisuseReports(
+        _ misuseOutput: Their.WorkOutput<Int, JobTestsError>
+    ) async throws {
+        try await Their.stress {
+            let cancelCountsInsideReentry = Their.TestEventRecorder<Int>()
+            let eventRecorder = JobEventRecorder()
+            let misuseRecorder = JobMisuseRecorder()
+            let rejectedCancelReturns = Their.TestCountRecorder()
+            let rejectedEventRecorder = JobEventRecorder()
+            let reentrantSubscribeCalls = Their.TestCountRecorder()
+            let reentrantSubscribeReturns = Their.TestCountRecorder()
+            let workRecorder = JobStartRecorder()
+            let job = Their.Job<Int, JobTestsError>(
+                misuseHandler: { misuse in
+                    misuseRecorder.handler(misuse)
+                    workRecorder.emit(misuseOutput)
+                },
+                work: workRecorder.work
+            )
+            let onDeinit: @Sendable () -> Void = {
+                _ = reentrantSubscribeCalls.increment()
+                let rejectedCancel = job.subscribe(rejectedEventRecorder.append(_:))
+                _ = reentrantSubscribeReturns.increment()
+                cancelCountsInsideReentry.append(workRecorder.cancelCallsCount)
+                for _ in 0..<2 {
+                    rejectedCancel()
+                    _ = rejectedCancelReturns.increment()
+                    cancelCountsInsideReentry.append(workRecorder.cancelCallsCount)
+                }
+            }
+            let cancel = job.subscribe { [token = JobReentrantDeinitToken(onDeinit: onDeinit)] event in
+                withExtendedLifetime(token) {
+                    eventRecorder.append(event)
+                }
+            }
+
+            withExtendedLifetime(job) {
+                cancel()
+                cancel()
+                workRecorder.emit(.value(100))
+
+                #expect(reentrantSubscribeCalls.count == 1)
+                #expect(reentrantSubscribeReturns.count == 1)
+                #expect(rejectedCancelReturns.count == 2)
+                #expect(misuseRecorder.misuses.map(\.message) == [
+                    "Job supports only one subscriber per lifecycle."
+                ])
+                #expect(eventRecorder.events.isEmpty == true)
+                #expect(rejectedEventRecorder.events.isEmpty == true)
+                #expect(workRecorder.startCallsCount == 1)
+                #expect(workRecorder.cancelCallsCount == 1)
+                let cancelCounts = cancelCountsInsideReentry.events
+                #expect(cancelCounts.count == 3)
+                #expect(cancelCounts.allSatisfy { $0 == cancelCounts.first })
+            }
+        }
+    }
+
     @Test func cancelRepeatedlyStopsOnlyOnce() async throws {
         try await Their.stress {
             let cancelSignal = JobTestSignal()
@@ -50,7 +112,9 @@ struct JobTests {
             _ = job.subscribe { _ in }
             try await misuseRecorder.waitForCount(1)
             #expect(eventRecorder.events.isEmpty == true)
-            #expect(misuseRecorder.misuses.count == 1)
+            #expect(misuseRecorder.misuses.map(\.message) == [
+                "Job supports only one subscriber per lifecycle."
+            ])
             #expect(startRecorder.cancelCallsCount == 1)
             #expect(startRecorder.startCallsCount == 1)
         }
@@ -156,7 +220,9 @@ struct JobTests {
             try await misuseRecorder.waitForCount(1)
             try await cancelSignal.wait()
             #expect(firstEventRecorder.events.isEmpty == true)
-            #expect(misuseRecorder.misuses.count == 1)
+            #expect(misuseRecorder.misuses.map(\.message) == [
+                "Job supports only one subscriber per lifecycle."
+            ])
             #expect(startRecorder.cancelCallsCount == 1)
             #expect(startRecorder.startCallsCount == 1)
         }
@@ -216,7 +282,9 @@ struct JobTests {
             _ = job.subscribe { _ in }
             try await misuseRecorder.waitForCount(1)
             #expect(eventRecorder.events == [.finished])
-            #expect(misuseRecorder.misuses.count == 1)
+            #expect(misuseRecorder.misuses.map(\.message) == [
+                "Job supports only one subscriber per lifecycle."
+            ])
             #expect(startRecorder.cancelCallsCount == 1)
             #expect(startRecorder.startCallsCount == 1)
         }
@@ -260,7 +328,9 @@ struct JobTests {
             _ = job.subscribe { _ in }
             try await misuseRecorder.waitForCount(1)
             #expect(eventRecorder.events == [.finished])
-            #expect(misuseRecorder.misuses.count == 1)
+            #expect(misuseRecorder.misuses.map(\.message) == [
+                "Job supports only one subscriber per lifecycle."
+            ])
             #expect(startRecorder.cancelCallsCount == 1)
             #expect(startRecorder.startCallsCount == 1)
         }
@@ -317,7 +387,9 @@ struct JobTests {
             _ = job.subscribe { _ in }
             try await misuseRecorder.waitForCount(1)
             #expect(eventRecorder.events == [.failure(.sample)])
-            #expect(misuseRecorder.misuses.count == 1)
+            #expect(misuseRecorder.misuses.map(\.message) == [
+                "Job supports only one subscriber per lifecycle."
+            ])
             #expect(startRecorder.cancelCallsCount == 1)
             #expect(startRecorder.startCallsCount == 1)
         }
@@ -340,7 +412,9 @@ struct JobTests {
             _ = job.subscribe { _ in }
             try await misuseRecorder.waitForCount(1)
             #expect(eventRecorder.events == [.failure(.sample)])
-            #expect(misuseRecorder.misuses.count == 1)
+            #expect(misuseRecorder.misuses.map(\.message) == [
+                "Job supports only one subscriber per lifecycle."
+            ])
             #expect(startRecorder.cancelCallsCount == 1)
             #expect(startRecorder.startCallsCount == 1)
         }
@@ -379,6 +453,19 @@ struct JobTests {
             #expect(startRecorder.cancelCallsCount == 1)
             #expect(startRecorder.startCallsCount == 1)
         }
+    }
+}
+
+private final class JobReentrantDeinitToken: Sendable {
+
+    private let onDeinit: @Sendable () -> Void
+
+    init(onDeinit: @escaping @Sendable () -> Void) {
+        self.onDeinit = onDeinit
+    }
+
+    deinit {
+        onDeinit()
     }
 }
 

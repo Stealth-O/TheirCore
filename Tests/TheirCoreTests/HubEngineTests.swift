@@ -7,6 +7,122 @@ import TheirCoreTesting
 @Suite
 struct HubEngineTests {
 
+    /// Replacing or clearing a diagnostic hook must release its old captures
+    /// after unlocking. The nonblocking probe reports the boundary without
+    /// attempting a recursive unfair-lock acquisition.
+    @Test(arguments: [false, true])
+    func afterSnapshotHookReleasesOldCaptureOutsideLock(replace: Bool) async throws {
+        try await Their.stress {
+            let deinits = Their.TestCountRecorder()
+            let hub = HubEngine<Int, HubEngineTestsError>(work: { _ in {} })
+            let observations = Their.TestEventRecorder<Bool>()
+            let reentries = Their.TestCountRecorder()
+            hub.setAfterSnapshotForTests(makeHubEngineHook(
+                deinits: deinits,
+                hub: hub,
+                observations: observations,
+                reentries: reentries
+            ))
+            #expect(deinits.count == 0)
+
+            if replace {
+                hub.setAfterSnapshotForTests({})
+            } else {
+                hub.setAfterSnapshotForTests(nil)
+            }
+
+            withExtendedLifetime(hub) {
+                #expect(deinits.count == 1)
+                #expect(observations.events == [true])
+                #expect(hub.isLockAvailableForTests())
+                #expect(reentries.count == 1)
+            }
+            hub.setAfterSnapshotForTests(nil)
+            #expect(deinits.count == 1)
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func beforeDetachedEngineStopHookReleasesOldCaptureOutsideLock(replace: Bool) async throws {
+        try await Their.stress {
+            let deinits = Their.TestCountRecorder()
+            let hub = HubEngine<Int, HubEngineTestsError>(work: { _ in {} })
+            let observations = Their.TestEventRecorder<Bool>()
+            let reentries = Their.TestCountRecorder()
+            hub.setBeforeDetachedEngineStopForTests(makeHubEngineHook(
+                deinits: deinits,
+                hub: hub,
+                observations: observations,
+                reentries: reentries
+            ))
+            #expect(deinits.count == 0)
+
+            if replace {
+                hub.setBeforeDetachedEngineStopForTests({})
+            } else {
+                hub.setBeforeDetachedEngineStopForTests(nil)
+            }
+
+            withExtendedLifetime(hub) {
+                #expect(deinits.count == 1)
+                #expect(observations.events == [true])
+                #expect(hub.isLockAvailableForTests())
+                #expect(reentries.count == 1)
+            }
+            hub.setBeforeDetachedEngineStopForTests(nil)
+            #expect(deinits.count == 1)
+        }
+    }
+
+    /// Cancellation should retire a registered diagnostic waiter so a failed
+    /// state expectation cannot prevent TheirCoreTesting's cooperative timeout join.
+    /// Reach the requested state even after a failed assertion or parent
+    /// cancellation, then join the waiter before releasing its subscription.
+    @Test func cancelledStateWaiterIsRemovedBeforeTargetTransition() async throws {
+        try await Their.stress {
+            let completions = Their.TestCountRecorder()
+            let registered = Their.TestSignal()
+            let startRecorder = HubEngineStartRecorder()
+            let hub = HubEngine<Int, HubEngineTestsError>(work: startRecorder.work)
+            let waiter = Task {
+                await hub.waitForStateForTests(
+                    .init(isRunning: true, subscribersCount: 1),
+                    onSuspend: registered.signal
+                )
+                _ = completions.increment()
+            }
+
+            do {
+                try await registered.wait()
+                #expect(hub.stateWaitersCountForTests() == 1)
+                waiter.cancel()
+
+                #expect(hub.stateWaitersCountForTests() == 0)
+                #expect(hub.getState() == .init(isRunning: false, subscribersCount: 0))
+                #expect(startRecorder.startCallsCount == 0)
+                try await completions.waitForCount(1)
+                #expect(hub.getState() == .init(isRunning: false, subscribersCount: 0))
+                #expect(startRecorder.startCallsCount == 0)
+            } catch {
+                waiter.cancel()
+                let cleanupCancel = hub.subscribe { _ in }
+                await waiter.value
+                cleanupCancel()
+                throw error
+            }
+
+            let cleanupCancel = hub.subscribe { _ in }
+            await waiter.value
+            cleanupCancel()
+
+            #expect(completions.count == 1)
+            #expect(hub.stateWaitersCountForTests() == 0)
+            #expect(hub.getState() == .init(isRunning: false, subscribersCount: 0))
+            #expect(startRecorder.cancelCallsCount == 1)
+            #expect(startRecorder.startCallsCount == 1)
+        }
+    }
+
     @Test func deinitCancelsActiveJob() async throws {
         try await Their.stress {
             let startRecorder = HubEngineStartRecorder()
@@ -163,6 +279,89 @@ struct HubEngineTests {
                 stored = nil
             }
             #expect(hub.getState() == .init(isRunning: false, subscribersCount: 0))
+        }
+    }
+
+    /// The task is already cancelled when it enters the Hub wait. No suspended
+    /// waiter should be installed, and no state transition is needed to finish.
+    @Test func stateWaiterCancelledBeforeRegistrationCompletesWhileIdle() async throws {
+        try await Their.stress {
+            let completions = Their.TestCountRecorder()
+            let entered = Their.TestSignal()
+            let gate = Their.TestSignal()
+            let startRecorder = HubEngineStartRecorder()
+            let hub = HubEngine<Int, HubEngineTestsError>(work: startRecorder.work)
+            let suspensions = Their.TestCountRecorder()
+            let waiter = Task {
+                entered.signal()
+                try? await gate.wait()
+                #expect(Task.isCancelled)
+                await hub.waitForStateForTests(
+                    .init(isRunning: true, subscribersCount: 1),
+                    onSuspend: { _ = suspensions.increment() }
+                )
+                _ = completions.increment()
+            }
+
+            do {
+                try await entered.wait()
+                waiter.cancel()
+                try await completions.waitForCount(1)
+            } catch {
+                waiter.cancel()
+                let cleanupCancel = hub.subscribe { _ in }
+                await waiter.value
+                cleanupCancel()
+                throw error
+            }
+            await waiter.value
+
+            #expect(completions.count == 1)
+            #expect(hub.stateWaitersCountForTests() == 0)
+            #expect(hub.getState() == .init(isRunning: false, subscribersCount: 0))
+            #expect(startRecorder.cancelCallsCount == 0)
+            #expect(startRecorder.startCallsCount == 0)
+            #expect(suspensions.count == 0)
+        }
+    }
+
+    @Test func stateWaiterTargetTransitionBeforeCancelCompletesOnlyOnce() async throws {
+        try await Their.stress {
+            let completions = Their.TestCountRecorder()
+            let registered = Their.TestSignal()
+            let startRecorder = HubEngineStartRecorder()
+            let hub = HubEngine<Int, HubEngineTestsError>(work: startRecorder.work)
+            let waiter = Task {
+                await hub.waitForStateForTests(
+                    .init(isRunning: true, subscribersCount: 1),
+                    onSuspend: registered.signal
+                )
+                _ = completions.increment()
+            }
+
+            do {
+                try await registered.wait()
+            } catch {
+                waiter.cancel()
+                let cleanupCancel = hub.subscribe { _ in }
+                await waiter.value
+                cleanupCancel()
+                throw error
+            }
+            let cancel = hub.subscribe { _ in }
+            // Subscribe notifies synchronously, so the target transition, not
+            // the cancellations below, must already have settled the waiter.
+            #expect(hub.stateWaitersCountForTests() == 0)
+            waiter.cancel()
+            waiter.cancel()
+            await waiter.value
+            cancel()
+
+            #expect(completions.count == 1)
+            #expect(hub.stateWaitersCountForTests() == 0)
+            #expect(hub.getState() == .init(isRunning: false, subscribersCount: 0))
+            #expect(startRecorder.cancelCallsCount == 1)
+            #expect(startRecorder.startCallsCount == 1)
         }
     }
 
@@ -566,6 +765,19 @@ private enum HubEngineTestsError: Swift.Error, Sendable {
 private typealias HubEngineEventRecorder = Their.TestEventRecorder<Their.HubEvent<Int, HubEngineTestsError>>
 private typealias HubEngineStartRecorder = Their.TestWorkRecorder<Int, HubEngineTestsError>
 
+private final class HubEngineHookCapture: Sendable {
+
+    private let onDeinit: @Sendable () -> Void
+
+    init(onDeinit: @escaping @Sendable () -> Void) {
+        self.onDeinit = onDeinit
+    }
+
+    deinit {
+        onDeinit()
+    }
+}
+
 private final class HubEngineLateSubscriberProbe: Sendable {
 
     private let didSubscribe = Their.Lock(false)
@@ -592,5 +804,26 @@ private final class HubEngineLateSubscriberProbe: Sendable {
         secondCancel.withLock { secondCancel in
             secondCancel = cancel
         }
+    }
+}
+
+private func makeHubEngineHook(
+    deinits: Their.TestCountRecorder,
+    hub: HubEngine<Int, HubEngineTestsError>,
+    observations: Their.TestEventRecorder<Bool>,
+    reentries: Their.TestCountRecorder
+) -> @Sendable () -> Void {
+    let capture = HubEngineHookCapture { [weak hub] in
+        _ = deinits.increment()
+        let isAvailable = hub?.isLockAvailableForTests() ?? false
+        observations.append(isAvailable)
+        guard isAvailable, let hub else {
+            return
+        }
+        _ = hub.getState()
+        _ = reentries.increment()
+    }
+    return {
+        withExtendedLifetime(capture) {}
     }
 }

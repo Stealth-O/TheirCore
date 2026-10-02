@@ -17,7 +17,7 @@ struct LifecycleLoggingTests {
                 let logging = Their.LifecycleLogging(
                     file: "RootHub.swift",
                     line: 77,
-                    label: "discovery"
+                    label: "wristband-discovery"
                 )
                 let work = Their.TestWorkRecorder<Int, LifecycleLoggingTestsError>()
                 let hub: Their.Hub<Int, LifecycleLoggingTestsError> = Their.Hub(
@@ -125,6 +125,51 @@ struct LifecycleLoggingTests {
         #expect(recorder.liveCounts == expectedCounts)
     }
 
+    @Test(arguments: [false, true])
+    func outputCaptureDeinitCanReenterLogging(reset: Bool) async throws {
+        try await Their.stress(count: 1) {
+            let deinitializations = Their.TestCountRecorder()
+            let logging = Their.LifecycleLogging(
+                file: "CaptureReentry.swift",
+                line: 1,
+                label: "Capture"
+            )
+            let recorder = LifecycleLoggingOutputRecorder()
+            Their.LifecycleLogging.resetForTests()
+            defer {
+                Their.LifecycleLogging.resetForTests()
+            }
+            Their.LifecycleLogging.setOutputForTests { _ in }
+            logging.logLifecycle("job init")
+            LifecycleLoggingLifetimeCapture.installOutput {
+                _ = deinitializations.increment()
+                guard Their.LifecycleLogging.isStoreLockAvailableForTests() else {
+                    Issue.record("Expected output destruction outside the logging store lock.")
+                    return
+                }
+                if reset {
+                    Their.LifecycleLogging.setOutputForTests(recorder.append(_:))
+                }
+                logging.logLifecycle("job init")
+            }
+
+            if reset {
+                Their.LifecycleLogging.resetForTests()
+            } else {
+                Their.LifecycleLogging.setOutputForTests(recorder.append(_:))
+            }
+
+            let liveCount = reset ? 1 : 2
+            #expect(deinitializations.count == 1)
+            #expect(recorder.lines == ["~~| [Capture] (\(liveCount))"])
+            logging.logLifecycle("job deinit")
+            #expect(recorder.lines == [
+                "~~| [Capture] (\(liveCount))",
+                "~~| [Capture] (\(liveCount - 1))",
+            ])
+        }
+    }
+
     @Test func outputDrainsReentrantLogsInFIFOOrder() async throws {
         try await Their.stress(count: 1) {
             let logging = Their.LifecycleLogging(
@@ -159,6 +204,29 @@ struct LifecycleLoggingTests {
                 "begin ~~| [Reentrant] (2)",
                 "end ~~| [Reentrant] (2)",
             ])
+        }
+    }
+
+    @Test func outputReplacementReleasesCaptureOutsideStoreLock() async throws {
+        try await Their.stress(count: 1) {
+            let deinitializations = Their.TestCountRecorder()
+            let lockObservations = Their.TestEventRecorder<Bool>()
+            Their.LifecycleLogging.resetForTests()
+            defer {
+                Their.LifecycleLogging.resetForTests()
+            }
+            // Keep the queue idle so the store owns the only sink reference.
+            LifecycleLoggingLifetimeCapture.installOutput {
+                lockObservations.append(Their.LifecycleLogging.isStoreLockAvailableForTests())
+                _ = deinitializations.increment()
+            }
+            #expect(deinitializations.count == 0)
+
+            Their.LifecycleLogging.setOutputForTests { _ in }
+
+            #expect(deinitializations.count == 1)
+            #expect(lockObservations.events == [true])
+            #expect(Their.LifecycleLogging.isStoreLockAvailableForTests())
         }
     }
 
@@ -201,6 +269,29 @@ struct LifecycleLoggingTests {
                 "end ~~| [Reset] (2)",
                 "~~| [Reset] (1)",
             ])
+        }
+    }
+
+    @Test func resetReleasesOutputCaptureOutsideStoreLock() async throws {
+        try await Their.stress(count: 1) {
+            let deinitializations = Their.TestCountRecorder()
+            let lockObservations = Their.TestEventRecorder<Bool>()
+            Their.LifecycleLogging.resetForTests()
+            defer {
+                Their.LifecycleLogging.resetForTests()
+            }
+            // No active output or queued line retains the previous sink.
+            LifecycleLoggingLifetimeCapture.installOutput {
+                lockObservations.append(Their.LifecycleLogging.isStoreLockAvailableForTests())
+                _ = deinitializations.increment()
+            }
+            #expect(deinitializations.count == 0)
+
+            Their.LifecycleLogging.resetForTests()
+
+            #expect(deinitializations.count == 1)
+            #expect(lockObservations.events == [true])
+            #expect(Their.LifecycleLogging.isStoreLockAvailableForTests())
         }
     }
 
@@ -364,6 +455,26 @@ struct LifecycleLoggingTests {
 }
 
 private enum LifecycleLoggingTestsError: Swift.Error, Sendable {}
+
+private final class LifecycleLoggingLifetimeCapture: Sendable {
+
+    private let onDeinit: @Sendable () -> Void
+
+    init(onDeinit: @escaping @Sendable () -> Void) {
+        self.onDeinit = onDeinit
+    }
+
+    deinit {
+        onDeinit()
+    }
+
+    static func installOutput(onDeinit: @escaping @Sendable () -> Void) {
+        let capture = LifecycleLoggingLifetimeCapture(onDeinit: onDeinit)
+        Their.LifecycleLogging.setOutputForTests { [capture] _ in
+            withExtendedLifetime(capture) {}
+        }
+    }
+}
 
 private final class LifecycleLoggingOutputRecorder: Sendable {
 

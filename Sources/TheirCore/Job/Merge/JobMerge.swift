@@ -5,12 +5,13 @@ private enum MergedJobLifecycleState: Sendable {
     case pending
     case started
     case terminated
+    case terminating
 }
 
 private enum MergedJobProcessOutput<Value: Sendable, Failure: Swift.Error & Sendable>: Sendable {
 
-    case failure(failure: Failure, record: MergedJobRecord<Value, Failure>)
     case finished(endedCancel: Their.WorkCancel?, record: MergedJobRecord<Value, Failure>)
+    case failure(failure: Failure, record: MergedJobRecord<Value, Failure>)
     case release(Their.WorkCancel?)
     case value(sink: Their.JobSink<Value, Failure>, value: Value)
 }
@@ -26,6 +27,7 @@ private struct MergedJobRecord<Value: Sendable, Failure: Swift.Error & Sendable>
     var cancels: [Their.WorkCancel?]
     var endedCount = 0
     var endedUpstreams: [Bool]
+    var hasPendingFailure = false
     var inputs = DrainQueue<MergedJobInput<Value, Failure>>()
     var lifecycleState = MergedJobLifecycleState.pending
     var sink: Their.JobSink<Value, Failure>?
@@ -35,20 +37,23 @@ private struct MergedJobRecord<Value: Sendable, Failure: Swift.Error & Sendable>
         endedUpstreams = Array(repeating: false, count: upstreamCount)
     }
 
-    /// Moves owned callbacks and queued inputs into an output kept alive after
-    /// unlock. Ordinary value processing never snapshots this record.
-    mutating func takeTerminated() -> Self {
+    /// Moves retired ownership out for post-lock release. A pending terminal
+    /// keeps its sink cancellable in the owner until upstream teardown returns.
+    mutating func takeTerminated(pendingTerminal: Bool = false) -> Self {
         let detached = self
         cancels = Array(repeating: nil, count: cancels.count)
         _ = inputs.takePending()
-        lifecycleState = .terminated
-        sink = nil
+        lifecycleState = pendingTerminal ? .terminating : .terminated
+        sink = pendingTerminal ? detached.sink : nil
         return detached
     }
 }
 
 /// Owner of one merged `Job` lifecycle. Upstream events from every source enter
 /// one FIFO queue, and a single drainer delivers them in append order.
+/// Enqueuing failure closes the subscription loop without changing that FIFO.
+/// Terminal processing enters `.terminating` until post-lock teardown returns;
+/// cancellation can clear the pending terminal sink before its final claim.
 private final class MergedJobState<Value: Sendable, Failure: Swift.Error & Sendable>: Sendable {
 
     private let lock: Their.Lock<MergedJobRecord<Value, Failure>>
@@ -69,10 +74,12 @@ private final class MergedJobState<Value: Sendable, Failure: Swift.Error & Senda
 
     func cancel() {
         let detached: MergedJobRecord<Value, Failure>? = lock.withLock { record in
-            guard record.lifecycleState == .started else {
+            switch record.lifecycleState {
+            case .pending, .terminated:
                 return nil
+            case .started, .terminating:
+                return record.takeTerminated()
             }
-            return record.takeTerminated()
         }
         withExtendedLifetime(detached) {
             detached?.cancels.forEach { $0?() }
@@ -98,6 +105,11 @@ private final class MergedJobState<Value: Sendable, Failure: Swift.Error & Senda
         let shouldDrain = lock.withLock { record in
             guard record.lifecycleState == .started else {
                 return false
+            }
+            if case .failure = event {
+                // Accepting failure stops new source starts immediately, while
+                // delivery still waits behind every earlier queued value.
+                record.hasPendingFailure = true
             }
             return record.inputs.append(
                 MergedJobInput(
@@ -139,15 +151,14 @@ private final class MergedJobState<Value: Sendable, Failure: Swift.Error & Senda
                 }
                 return .finished(
                     endedCancel: endedCancel,
-                    record: record.takeTerminated()
+                    record: record.takeTerminated(pendingTerminal: true)
                 )
             case .failure(let failure):
-                // Teardown runs unconditionally — same shape as
-                // `EvolvedJobState.process(.failure)` — so upstream cancels can
-                // never be skipped; the sink is carried out optionally.
+                // Detach every upstream cancel for unconditional teardown.
+                // Keep terminal delivery cancellable until that work returns.
                 return .failure(
                     failure: failure,
-                    record: record.takeTerminated()
+                    record: record.takeTerminated(pendingTerminal: true)
                 )
             case .value(let value):
                 guard let sink = record.sink else {
@@ -166,12 +177,12 @@ private final class MergedJobState<Value: Sendable, Failure: Swift.Error & Senda
         case .finished(let endedCancel, let record):
             withExtendedLifetime((endedCancel, record)) {
                 record.cancels.forEach { $0?() }
-                record.sink?(.finished)
+                takeTerminalSink()?(.finished)
             }
         case .failure(let failure, let record):
             withExtendedLifetime(record) {
                 record.cancels.forEach { $0?() }
-                record.sink?(.failure(failure))
+                takeTerminalSink()?(.failure(failure))
             }
         case .release(let cancel):
             withExtendedLifetime(cancel) {}
@@ -217,7 +228,7 @@ private final class MergedJobState<Value: Sendable, Failure: Swift.Error & Senda
         }
         for index in upstreams.indices {
             let shouldSubscribe = lock.withLock { record in
-                record.lifecycleState == .started
+                record.lifecycleState == .started && record.hasPendingFailure == false
             }
             guard shouldSubscribe else {
                 break
@@ -232,6 +243,7 @@ private final class MergedJobState<Value: Sendable, Failure: Swift.Error & Senda
                 // instead is a no-op on the terminated upstream and drops the
                 // pin synchronously.
                 guard record.lifecycleState == .started,
+                      record.hasPendingFailure == false,
                       record.endedUpstreams[index] == false
                 else {
                     return true
@@ -245,6 +257,20 @@ private final class MergedJobState<Value: Sendable, Failure: Swift.Error & Senda
         }
         return { [weak self] in
             self?.cancel()
+        }
+    }
+
+    /// Upstream teardown may cancel this subscription reentrantly. Claim the
+    /// terminal sink only after it returns, while still using the owner lock.
+    private func takeTerminalSink() -> Their.JobSink<Value, Failure>? {
+        lock.withLock { record in
+            guard record.lifecycleState == .terminating else {
+                return nil
+            }
+            let sink = record.sink
+            record.lifecycleState = .terminated
+            record.sink = nil
+            return sink
         }
     }
 }
@@ -281,8 +307,9 @@ public extension Their.Job {
     /// types; callers should use `map` / `mapError` first when combining
     /// domain-specific sources into one input enum.
     ///
-    /// Subscription starts every upstream job once, in array order, before
-    /// `subscribe` returns. Successful values from all upstreams enter one FIFO
+    /// Subscription starts upstream jobs once, in array order, before
+    /// `subscribe` returns, stopping if failure or cancellation intervenes.
+    /// Successful values from all upstreams enter one FIFO
     /// queue and are delivered downstream in append order; values from the same
     /// upstream keep their emission order.
     ///
@@ -292,22 +319,24 @@ public extension Their.Job {
     /// slot (the chain is already terminated, keeping the cancel would only pin
     /// it) and shrinks the live set. The `.finished` of the last live upstream is
     /// terminal: it is FIFO-ordered behind values queued before it, delivers
-    /// one downstream `.finished` and tears the merged lifecycle down. An upstream
-    /// that ends synchronously while the subscription loop is still running is
-    /// counted immediately; if it was the last one, later upstreams are never
-    /// started, mirroring synchronous failure.
+    /// one downstream `.finished` and tears the merged lifecycle down. A synchronous
+    /// end is counted when dequeued, including while subscription is in progress;
+    /// the remaining upstreams must still start before all can have ended.
     ///
     /// Terminal failure: a failure from any upstream is a queued input processed
     /// by the same single drainer, so values enqueued before it are still
     /// delivered first and the failure never overtakes them; inputs queued after
-    /// the failure are dropped. Processing the failure cancels every
-    /// already-started upstream subscription exactly once and delivers the
-    /// failure once. A failure that arrives synchronously while the subscription
-    /// loop is still running stops the loop, so later upstreams are never
-    /// started. Late values or failures after cancel or terminal failure are
-    /// ignored; as everywhere in TheirCore, a downstream sink callback already
-    /// running on the drainer is not interrupted and may overlap a concurrent
-    /// cancel.
+    /// the failure are dropped. Processing the failure cancels every upstream
+    /// whose cancel is already stored exactly once, then claims its terminal
+    /// sink. Cancellation reentered from that teardown clears the pending sink
+    /// and suppresses that callback. Enqueuing a failure stops further
+    /// subscription-loop iterations immediately, even while an earlier callback
+    /// holds the drainer; the current upstream's late-returned cancel is invoked
+    /// immediately when its `subscribe` returns, which can be after the terminal
+    /// callback, so that teardown cannot suppress delivery. Late values or
+    /// failures after cancel or terminal failure are ignored; as everywhere in
+    /// TheirCore, a downstream sink callback already claimed by the drainer is not
+    /// interrupted and may overlap a concurrent cancel.
     ///
     /// Misuse: `Job.merge([])` is invalid and reports `Misuse` on subscribe.
     /// Like every `Job`, the merged job is single-subscriber and

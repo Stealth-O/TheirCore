@@ -55,6 +55,26 @@ struct LockTests {
         }
     }
 
+    /// The lifetime regressions probe the owner's lock from a capture's
+    /// destructor on this same thread. Verify that this observation is safe
+    /// and that failure to acquire never invokes the probe body.
+    @Test func withLockIfAvailableReturnsNilWhileSameThreadHoldsLock() async throws {
+        try await Their.stress {
+            let box = LockBox()
+            let calls = Their.TestCountRecorder()
+            let observation: Int? = box.lock.withLock { _ in
+                box.lock.withLockIfAvailable { value in
+                    _ = calls.increment()
+                    return value
+                }
+            }
+
+            #expect(observation == nil)
+            #expect(calls.count == 0)
+            #expect(box.lock.withLockIfAvailable { $0 } == 0)
+        }
+    }
+
     @Test func withLockIfAvailableRunsBodyAndReturnsResultWhenLockIsFree() async throws {
         try await Their.stress {
             let lock = Their.Lock(10)

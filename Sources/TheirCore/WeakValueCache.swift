@@ -14,7 +14,8 @@ extension Their {
     /// reentrant). Dead entries are pruned lazily — only the insert path (a miss)
     /// walks the dictionary, read hits are O(1) — so the cache cannot grow
     /// unboundedly while keys are touched. Copies of the cache share one backing
-    /// storage.
+    /// storage. Pruned keys and temporary strong reads of weak values are released
+    /// after unlocking, so their destructors may safely look up another cache value.
     ///
     /// When `Value` is a `Hub`, `job(forKey:orInsert:)` reads or inserts the hub and
     /// then exposes it as a fresh one-subscriber `Job` via `Hub.job()`; it adds no
@@ -51,6 +52,16 @@ extension Their {
             )
         }
 
+        #if DEBUG
+        /// Non-owning probe so a cached key's destructor can observe the lock
+        /// without retaining the storage or attempting a recursive acquisition.
+        func lockAvailabilityProbeForTests() -> @Sendable () -> Bool {
+            { [weak storage] in
+                storage?.isLockAvailableForTests() ?? false
+            }
+        }
+        #endif
+
         /// Returns the live cached value for `key`, or stores and returns the value produced by `makeValue` if no live entry exists.
         ///
         /// `makeValue` runs synchronously while the cache lock is held, so it must be fast and must not call back into the same cache (the underlying lock is not reentrant).
@@ -70,20 +81,35 @@ private final class WeakValueCacheStorage<Key: Hashable & Sendable, Value: AnyOb
 
     private let state = Their.Lock(WeakValueCacheState<Key, Value>())
 
+    #if DEBUG
+    func isLockAvailableForTests() -> Bool {
+        state.withLockIfAvailable { _ in true } ?? false
+    }
+    #endif
+
     func value(
         forKey key: Key,
         orInsert makeValue: () -> Value
     ) -> Value {
-        state.withLock { state in
+        let result = state.withLock { state -> (
+            value: Value,
+            retiredEntries: [Key: WeakValueCacheBox<Value>],
+            retainedValues: [Value]
+        ) in
             if let value = state.values[key]?.value {
-                return value
+                return (value, [:], [])
             }
             // Cache miss: prune dead entries before inserting so the cache does not
             // accumulate dead keys over time. Read hits skip the walk entirely.
-            state.prune()
+            let cleanup = state.prune()
             let value = makeValue()
             state.values[key] = WeakValueCacheBox(value)
-            return value
+            return (value, cleanup.retiredEntries, cleanup.retainedValues)
+        }
+        // A retired key or the last temporary owner of a live value may reenter
+        // this cache from deinit. Keep both alive until the lock is released.
+        return withExtendedLifetime(result) {
+            result.value
         }
     }
 }
@@ -92,10 +118,20 @@ private struct WeakValueCacheState<Key: Hashable & Sendable, Value: AnyObject & 
 
     var values: [Key: WeakValueCacheBox<Value>] = [:]
 
-    mutating func prune() {
+    mutating func prune() -> (
+        retiredEntries: [Key: WeakValueCacheBox<Value>],
+        retainedValues: [Value]
+    ) {
+        let retiredEntries = values
+        var retainedValues: [Value] = []
         values = values.filter { _, box in
-            box.value != nil
+            guard let value = box.value else {
+                return false
+            }
+            retainedValues.append(value)
+            return true
         }
+        return (retiredEntries, retainedValues)
     }
 }
 

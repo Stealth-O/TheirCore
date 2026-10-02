@@ -15,7 +15,7 @@ It was extracted from an app whose features are mostly written by coding agents.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Stealth-O/TheirCore.git", from: "0.1.0")
+    .package(url: "https://github.com/Stealth-O/TheirCore.git", from: "0.1.1")
 ],
 targets: [
     .target(name: "App", dependencies: ["TheirCore"]),
@@ -145,10 +145,22 @@ import TheirCoreTesting
 
 ## How It Behaves
 
-- Each primitive is a small state machine behind one lock, and user callbacks never run under that lock.
+- Each primitive is a small state machine behind one lock. Sinks, transforms, cancellation and cleanup run outside that lock; the weak cache's read-or-create factory deliberately runs inside its cache lock.
 - Reports enter a FIFO queue that one caller drains at a time, so a terminal event never overtakes values reported before it.
 - Nothing hops threads. Callbacks run on the thread that reported the event, so hop to the main actor yourself before touching UI.
 - Subscribing twice to a `Their.Job`, or another incorrect use, is reported as `Their.Misuse`. The default handler stops the process.
+
+## 0.1.1
+
+This release brings the current Core and CoreTesting lifecycle implementation into the package while preserving the `Their` API:
+
+- A job's sink slot closes permanently before teardown, so reentrant subscription cannot install a rejected sink.
+- Cancellation during an evolution's failure mapping or a merge's upstream teardown suppresses a terminal callback that has not yet been claimed.
+- A merge stops starting sources as soon as a failure is queued, while still delivering earlier queued values first. A cancel returned late is invoked when the source subscription returns.
+- Weak-cache entries, replaced logging outputs, diagnostic hooks and test-recorder reports release their retired captures after unlocking.
+- Internal hub state waits complete once on either cancellation or the requested transition.
+
+Validated with Swift 6.3.3: 435 tests in 36 suites, a release build, and an unchanged public symbol graph for both libraries (204 symbols compared with 0.1.0).
 
 ## Running the Tests
 

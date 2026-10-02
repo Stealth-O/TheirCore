@@ -10,10 +10,17 @@ public extension Their.Job {
     ///
     /// Value: each upstream `.value` runs `transform`. A returned `NewValue` is
     /// emitted downstream as `.value`. A thrown error is mapped through `onThrow`
-    /// into the derived job's `Failure` and delivered once as a terminal `.failure`;
-    /// the lifecycle then terminates and the still-live upstream subscription is
-    /// cancelled, since — unlike an upstream terminal — the source has not ended
-    /// on its own. `onThrow` is the single seam that covers both a typed domain
+    /// into the derived job's `Failure`. The lifecycle then closes and cancels the
+    /// still-live upstream subscription if its cancel is already stored. The
+    /// terminal `.failure` is claimed after that teardown; cancellation of the
+    /// derived subscription during teardown suppresses the pending callback.
+    /// If the upstream cancel has not been stored yet, delivery does not wait
+    /// for it: `.failure` can arrive before `upstream.subscribe` returns, and its
+    /// late-returned cancel is invoked immediately afterward. That later
+    /// teardown cannot suppress an already-delivered failure. This applies both
+    /// to synchronous reports inside `subscribe` and to concurrent reports
+    /// before its cancel is stored. Cancellation from `onThrow` itself also
+    /// suppresses the failure. `onThrow` covers both a typed domain
     /// error and a generic fallback, e.g.
     /// `{ ($0 as? DomainError) ?? .invalidDocument(...) }`.
     ///
@@ -21,7 +28,7 @@ public extension Their.Job {
     /// upstream `.failure` is forwarded as-is. Normalise the failure first with
     /// `mapError` when the domain failure differs, then `tryMap` only has to
     /// produce that same `Failure` from a thrown error:
-    /// `upstream.mapError { .network($0) }.tryMap({ try decode($0) }) { ... }`.
+    /// `upstream.mapError { .firestore($0) }.tryMap({ try decode($0) }) { ... }`.
     ///
     /// Execution and lifecycle: built on the root `evolve` machinery, so it
     /// inherits that contract — upstream events enter one FIFO queue, a single

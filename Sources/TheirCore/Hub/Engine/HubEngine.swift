@@ -107,8 +107,8 @@ final class HubEngine<Value: Sendable, Failure: Swift.Error & Sendable>: Sendabl
     /// the cancel of in-flight upstream work happens transitively through
     /// `JobEngine.deinit`: nulling the reference is the only strong owner this
     /// engine holds, so ARC drops `JobEngine`, whose own `deinit` cancels the
-    /// active `WorkCancel`. The documented guarantee that deinit of an active
-    /// `HubEngine` cancels the active underlying `JobEngine` depends on that chain.
+    /// active `WorkCancel`. The README's "Deinit of an active `HubEngine`
+    /// cancels the active underlying `JobEngine`" claim depends on that chain.
     ///
     /// Subscriber bookkeeping is intentionally not cleared here: by the time
     /// `HubEngine.deinit` runs there are no callers that can observe state, so
@@ -141,6 +141,15 @@ final class HubEngine<Value: Sendable, Failure: Swift.Error & Sendable>: Sendabl
         state.withLock { lifecycle in
             lifecycle.beforeDetachedEngineStopForTests
         }
+    }
+#endif
+
+#if DEBUG
+    private func cancelStateWaiterForTests(id: UUID) {
+        let continuation = state.withLock { lifecycle in
+            lifecycle.stateWaiters.removeValue(forKey: id)?.continuation
+        }
+        continuation?.resume()
     }
 #endif
 
@@ -192,6 +201,12 @@ final class HubEngine<Value: Sendable, Failure: Swift.Error & Sendable>: Sendabl
 #endif
     }
 
+#if DEBUG
+    func isLockAvailableForTests() -> Bool {
+        state.withLockIfAvailable { _ in true } ?? false
+    }
+#endif
+
     /// Builds the `JobEngineSink` used by the inner `JobEngine` that this `HubEngine` owns for the engine
     /// generation identified by `token`.
     ///
@@ -225,23 +240,29 @@ final class HubEngine<Value: Sendable, Failure: Swift.Error & Sendable>: Sendabl
         let readyWaiters = state.withLock { lifecycle in
             lifecycle.takeWaiters(matching: lifecycle.currentState)
         }
-        readyWaiters.forEach { $0.continuation.resume() }
+        readyWaiters.forEach { $0.resume() }
     }
 #endif
 
 #if DEBUG
     func setAfterSnapshotForTests(_ hook: (@Sendable () -> Void)?) {
-        state.withLock { lifecycle in
+        let previous = state.withLock { lifecycle in
+            let previous = lifecycle.afterSnapshotForTests
             lifecycle.afterSnapshotForTests = hook
+            return previous
         }
+        withExtendedLifetime(previous) {}
     }
 #endif
 
 #if DEBUG
     func setBeforeDetachedEngineStopForTests(_ hook: (@Sendable () -> Void)?) {
-        state.withLock { lifecycle in
+        let previous = state.withLock { lifecycle in
+            let previous = lifecycle.beforeDetachedEngineStopForTests
             lifecycle.beforeDetachedEngineStopForTests = hook
+            return previous
         }
+        withExtendedLifetime(previous) {}
     }
 #endif
 
@@ -255,6 +276,14 @@ final class HubEngine<Value: Sendable, Failure: Swift.Error & Sendable>: Sendabl
             return Array(lifecycle.subscribers.values)
         }
     }
+
+#if DEBUG
+    func stateWaitersCountForTests() -> Int {
+        state.withLock { lifecycle in
+            lifecycle.stateWaiters.count
+        }
+    }
+#endif
 
     /// Three-phase subscriber registration.
     ///
@@ -406,20 +435,40 @@ final class HubEngine<Value: Sendable, Failure: Swift.Error & Sendable>: Sendabl
     }
 
 #if DEBUG
-    func waitForStateForTests(_ state: HubEngineState) async {
-        await withCheckedContinuation { continuation in
-            let shouldResume: Bool = self.state.withLock { lifecycle in
-                if lifecycle.currentState == state {
-                    return true
+    /// Cancellation silently completes this diagnostic wait. Its UUID is
+    /// registered before installing the cancellation handler, so an already
+    /// cancelled task can remove it before a continuation is stored. Removal
+    /// settles either cancellation or state satisfaction exactly once; every
+    /// continuation is resumed after releasing the shared lifecycle lock.
+    func waitForStateForTests(
+        _ state: HubEngineState,
+        onSuspend: (@Sendable () -> Void)? = nil
+    ) async {
+        let id = UUID()
+        self.state.withLock { lifecycle in
+            lifecycle.stateWaiters[id] = .init(continuation: nil, state: state)
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let shouldResume: Bool = self.state.withLock { lifecycle in
+                    guard lifecycle.stateWaiters[id] != nil else {
+                        return true
+                    }
+                    if lifecycle.currentState == state {
+                        lifecycle.stateWaiters.removeValue(forKey: id)
+                        return true
+                    }
+                    lifecycle.stateWaiters[id] = .init(continuation: continuation, state: state)
+                    return false
                 }
-                lifecycle.stateWaiters.append(
-                    HubEngineStateWaiter(continuation: continuation, state: state)
-                )
-                return false
+                if shouldResume {
+                    continuation.resume()
+                } else {
+                    onSuspend?()
+                }
             }
-            if shouldResume {
-                continuation.resume()
-            }
+        } onCancel: {
+            self.cancelStateWaiterForTests(id: id)
         }
     }
 #endif
@@ -428,7 +477,7 @@ final class HubEngine<Value: Sendable, Failure: Swift.Error & Sendable>: Sendabl
 #if DEBUG
 struct HubEngineStateWaiter: Sendable {
 
-    let continuation: CheckedContinuation<Void, Never>
+    let continuation: CheckedContinuation<Void, Never>?
     let state: HubEngineState
 }
 #endif
@@ -452,20 +501,22 @@ private struct HubEngineLifecycleState<Value: Sendable, Failure: Swift.Error & S
     var isStartingTerminated: Bool = false
     var jobEngine: JobEngine<Value, Failure>?
 #if DEBUG
-    var stateWaiters: [HubEngineStateWaiter] = []
+    var stateWaiters: [UUID: HubEngineStateWaiter] = [:]
 #endif
     var subscribers: [UUID: HubEngineSubscription<Value, Failure>] = [:]
     var tokenCounter = 0
 
 #if DEBUG
-    mutating func takeWaiters(matching state: HubEngineState) -> [HubEngineStateWaiter] {
-        var ready = [HubEngineStateWaiter]()
-        var pending = [HubEngineStateWaiter]()
-        for waiter in stateWaiters {
+    mutating func takeWaiters(matching state: HubEngineState) -> [CheckedContinuation<Void, Never>] {
+        var ready = [CheckedContinuation<Void, Never>]()
+        var pending = [UUID: HubEngineStateWaiter]()
+        for (id, waiter) in stateWaiters {
             if waiter.state == state {
-                ready.append(waiter)
+                if let continuation = waiter.continuation {
+                    ready.append(continuation)
+                }
             } else {
-                pending.append(waiter)
+                pending[id] = waiter
             }
         }
         stateWaiters = pending

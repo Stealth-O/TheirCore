@@ -535,6 +535,93 @@ struct JobMergeTests {
         }
     }
 
+    /// An already-started source fails while a later, still-live source is
+    /// inside `subscribe` and another callback holds the drainer. The queued
+    /// failure closes the loop, so the live source's late-returned cancel must
+    /// run immediately instead of waiting for failure teardown, and teardown
+    /// must not cancel it again. Both semaphore waits run on Dispatch workers.
+    @Test func mergeQueuedFailureCancelsLiveUpstreamReturningFromSubscribeImmediately() async throws {
+        try await Their.stress(count: 1) {
+            let eventRecorder = JobMergeEventRecorder()
+            let failingWork = JobMergeWorkRecorder()
+            let holdingWork = JobMergeWorkRecorder()
+            let lastWork = JobMergeWorkRecorder()
+            let reportWorkSlot = Their.Lock<BlockingWork<Void>?>(nil)
+            let sinkEntered = DispatchSemaphore(value: 0)
+            let sinkRelease = DispatchSemaphore(value: 0)
+            // Also release the workers if an async wait throws or the
+            // enclosing Their.stress timeout cancels this body.
+            defer {
+                sinkEntered.signal()
+                sinkRelease.signal()
+            }
+            let holdingJob = Their.Job { report in
+                let cancel = holdingWork.work(report: report)
+                let reportWork = BlockingWork {
+                    report(.value(1))
+                }
+                reportWorkSlot.withLock { $0 = reportWork }
+                sinkEntered.wait()
+                // The already-started first source fails on this thread; its
+                // failure queues behind the drainer parked in the value sink.
+                failingWork.emit(.failure(.sample))
+                return cancel
+            }
+            let merged = Their.Job.merge(
+                Their.Job(work: failingWork.work),
+                holdingJob,
+                Their.Job(work: lastWork.work)
+            )
+            let subscribeWork = BlockingWork {
+                merged.subscribe { event in
+                    if case .value(1) = event {
+                        sinkEntered.signal()
+                        sinkRelease.wait()
+                    }
+                    eventRecorder.append(event)
+                }
+            }
+            do {
+                let cancel = try await subscribeWork.value
+                defer { cancel() }
+                let reportWork = try #require(reportWorkSlot.withLock { $0 })
+                let eventsBeforeRelease = eventRecorder.events
+                let holdingCancelsBeforeRelease = holdingWork.cancelCallsCount
+                let startsBeforeRelease = [
+                    failingWork.startCallsCount,
+                    holdingWork.startCallsCount,
+                    lastWork.startCallsCount
+                ]
+
+                sinkRelease.signal()
+                try await reportWork.value
+                cancel()
+
+                #expect(eventsBeforeRelease.isEmpty == true)
+                #expect(holdingCancelsBeforeRelease == 1)
+                #expect(startsBeforeRelease == [1, 1, 0])
+                #expect(eventRecorder.events == [.value(1), .failure(.sample)])
+                #expect(failingWork.cancelCallsCount == 1)
+                #expect(holdingWork.cancelCallsCount == 1)
+                #expect(lastWork.cancelCallsCount == 0)
+            } catch {
+                sinkEntered.signal()
+                sinkRelease.signal()
+                // An unstructured task does not inherit this body's cancelled
+                // status, so both Dispatch workers are joined even on timeout.
+                let cleanup = Task {
+                    let cancel = try await subscribeWork.value
+                    cancel()
+                    if let reportWork = reportWorkSlot.withLock({ $0 }) {
+                        try await reportWork.value
+                    }
+                }
+                _ = await cleanup.result
+                throw error
+            }
+        }
+    }
+
     @Test func mergeRejectsResubscribeAfterCancelWithoutRestartingUpstreams() async throws {
         try await Their.stress {
             let eventRecorder = JobMergeEventRecorder()
@@ -708,6 +795,208 @@ struct JobMergeTests {
             #expect(eventRecorder.events == [.value(5), .finished])
             #expect(otherDriver.cancelCallsCount == 1)
             #expect(otherDriver.startCallsCount == 1)
+        }
+    }
+
+    /// A source can queue values before its synchronous failure while another
+    /// source holds the drainer. Closing further starts must preserve those
+    /// earlier values, including when the source cancel returns before drain.
+    @Test func mergeSynchronousFailurePreservesValuesQueuedBeforeFailureDuringSubscribe() async throws {
+        try await Their.stress(count: 1) {
+            let eventRecorder = JobMergeEventRecorder()
+            let firstWork = JobMergeWorkRecorder()
+            let reportWorkSlot = Their.Lock<BlockingWork<Void>?>(nil)
+            let secondWork = JobMergeWorkRecorder()
+            let sinkEntered = DispatchSemaphore(value: 0)
+            let sinkRelease = DispatchSemaphore(value: 0)
+            let thirdWork = JobMergeWorkRecorder()
+            defer {
+                sinkEntered.signal()
+                sinkRelease.signal()
+            }
+            let firstJob = Their.Job { report in
+                let cancel = firstWork.work(report: report)
+                let reportWork = BlockingWork {
+                    report(.value(1))
+                }
+                reportWorkSlot.withLock { $0 = reportWork }
+                sinkEntered.wait()
+                return cancel
+            }
+            let secondJob = Their.Job { report in
+                let cancel = secondWork.work(report: report)
+                report(.value(2))
+                report(.failure(.sample))
+                return cancel
+            }
+            let merged = Their.Job.merge(firstJob, secondJob, Their.Job(work: thirdWork.work))
+            let subscribeWork = BlockingWork {
+                merged.subscribe { event in
+                    if case .value(1) = event {
+                        sinkEntered.signal()
+                        sinkRelease.wait()
+                    }
+                    eventRecorder.append(event)
+                }
+            }
+            do {
+                let cancel = try await subscribeWork.value
+                defer { cancel() }
+                let reportWork = try #require(reportWorkSlot.withLock { $0 })
+                let eventsBeforeRelease = eventRecorder.events
+                let startsBeforeRelease = [
+                    firstWork.startCallsCount,
+                    secondWork.startCallsCount,
+                    thirdWork.startCallsCount
+                ]
+
+                sinkRelease.signal()
+                try await reportWork.value
+                cancel()
+
+                #expect(eventsBeforeRelease.isEmpty == true)
+                #expect(startsBeforeRelease == [1, 1, 0])
+                #expect(eventRecorder.events == [.value(1), .value(2), .failure(.sample)])
+                #expect(firstWork.cancelCallsCount == 1)
+                #expect(secondWork.cancelCallsCount == 1)
+                #expect(thirdWork.cancelCallsCount == 0)
+            } catch {
+                sinkEntered.signal()
+                sinkRelease.signal()
+                // Join both workers before a cancelled scenario can leave.
+                let cleanup = Task {
+                    let cancel = try await subscribeWork.value
+                    cancel()
+                    if let reportWork = reportWorkSlot.withLock({ $0 }) {
+                        try await reportWork.value
+                    }
+                }
+                _ = await cleanup.result
+                throw error
+            }
+        }
+    }
+
+    /// A synchronous failure must stop the subscription loop even when an
+    /// earlier source owns the drainer. Both semaphore waits run on Dispatch
+    /// workers; releasing the first sink then joins its entire report drain.
+    @Test func mergeSynchronousFailureQueuedBehindActiveDrainerStopsSubscriptionLoop() async throws {
+        try await Their.stress(count: 1) {
+            let eventRecorder = JobMergeEventRecorder()
+            let firstWork = JobMergeWorkRecorder()
+            let reportWorkSlot = Their.Lock<BlockingWork<Void>?>(nil)
+            let secondWork = JobMergeWorkRecorder()
+            let sinkEntered = DispatchSemaphore(value: 0)
+            let sinkRelease = DispatchSemaphore(value: 0)
+            let thirdWork = JobMergeWorkRecorder()
+            // Also release the worker waiting inside subscribe if an async
+            // wait throws or the enclosing Their.stress timeout cancels this body.
+            defer {
+                sinkEntered.signal()
+                sinkRelease.signal()
+            }
+            let firstJob = Their.Job { report in
+                let cancel = firstWork.work(report: report)
+                let reportWork = BlockingWork {
+                    report(.value(1))
+                }
+                reportWorkSlot.withLock { $0 = reportWork }
+                sinkEntered.wait()
+                return cancel
+            }
+            let secondJob = Their.Job { report in
+                let cancel = secondWork.work(report: report)
+                report(.failure(.sample))
+                return cancel
+            }
+            let merged = Their.Job.merge(firstJob, secondJob, Their.Job(work: thirdWork.work))
+            let subscribeWork = BlockingWork {
+                merged.subscribe { event in
+                    if case .value(1) = event {
+                        sinkEntered.signal()
+                        sinkRelease.wait()
+                    }
+                    eventRecorder.append(event)
+                }
+            }
+            do {
+                let cancel = try await subscribeWork.value
+                defer { cancel() }
+                let reportWork = try #require(reportWorkSlot.withLock { $0 })
+                let eventsBeforeRelease = eventRecorder.events
+                let startsBeforeRelease = [
+                    firstWork.startCallsCount,
+                    secondWork.startCallsCount,
+                    thirdWork.startCallsCount
+                ]
+
+                sinkRelease.signal()
+                try await reportWork.value
+                cancel()
+
+                #expect(eventsBeforeRelease.isEmpty == true)
+                #expect(startsBeforeRelease == [1, 1, 0])
+                #expect(eventRecorder.events == [.value(1), .failure(.sample)])
+                #expect(firstWork.cancelCallsCount == 1)
+                #expect(secondWork.cancelCallsCount == 1)
+                #expect(thirdWork.cancelCallsCount == 0)
+            } catch {
+                sinkEntered.signal()
+                sinkRelease.signal()
+                // An unstructured task does not inherit this body's cancelled
+                // status, so both Dispatch workers are joined even on timeout.
+                let cleanup = Task {
+                    let cancel = try await subscribeWork.value
+                    cancel()
+                    if let reportWork = reportWorkSlot.withLock({ $0 }) {
+                        try await reportWork.value
+                    }
+                }
+                _ = await cleanup.result
+                throw error
+            }
+        }
+    }
+
+    /// Failure tears down every live source before starting the merged terminal
+    /// callback. A source's WorkCancel may cancel the merged subscription; the
+    /// detached sink must not deliver a failure after that cancellation returns.
+    @Test func mergeUpstreamTeardownReentrantCancelSuppressesTerminalCallback() async throws {
+        try await Their.stress {
+            let cancelBox = Their.Lock<Their.WorkCancel?>(nil)
+            let reentrantCancelReturns = Their.TestCountRecorder()
+            let failingWork = Their.TestWorkRecorder<Int, JobMergeTestsError>()
+            let liveWork = Their.TestWorkRecorder<Int, JobMergeTestsError>(onCancel: {
+                cancelBox.withLock { $0 }?()
+                _ = reentrantCancelReturns.increment()
+            })
+            let eventRecorder = JobMergeEventRecorder()
+            let merged = Their.Job.merge(
+                Their.Job(work: failingWork.work),
+                Their.Job(work: liveWork.work)
+            )
+            let cancel = merged.subscribe(eventRecorder.append(_:))
+            cancelBox.withLock { $0 = cancel }
+            defer {
+                let detached = cancelBox.withLock { stored in
+                    let detached = stored
+                    stored = nil
+                    return detached
+                }
+                withExtendedLifetime(detached) {}
+                cancel()
+            }
+
+            failingWork.emit(.failure(.sample))
+            liveWork.emit(.value(2))
+            cancel()
+
+            #expect(reentrantCancelReturns.count == 1)
+            #expect(eventRecorder.events.isEmpty == true)
+            #expect(failingWork.cancelCallsCount == 1)
+            #expect(liveWork.cancelCallsCount == 1)
+            #expect(failingWork.startCallsCount == 1)
+            #expect(liveWork.startCallsCount == 1)
         }
     }
 

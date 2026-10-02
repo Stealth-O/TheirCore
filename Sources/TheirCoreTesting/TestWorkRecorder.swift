@@ -39,6 +39,12 @@ extension Their {
             report?(output)
         }
 
+        #if DEBUG
+        func isLockAvailableForTests() -> Bool {
+            lock.withLockIfAvailable { _ in true } ?? false
+        }
+        #endif
+
         private static func splitWaiters(
             count: Int,
             kind: TestWorkRecorderWaiter.Kind,
@@ -150,19 +156,24 @@ extension Their {
         public func work(
             report: @escaping Their.WorkReport<Value, Failure>
         ) -> Their.WorkCancel {
-            let readyWaiters = lock.withLock { record in
+            let output = lock.withLock { record in
+                let oldReport = record.report
                 record.report = report
                 record.startCallsCount += 1
-                let output = Self.splitWaiters(
+                let waiters = Self.splitWaiters(
                     count: record.startCallsCount,
                     kind: .start,
                     waiters: record.waiters
                 )
-                record.waiters = output.pending
-                return output.ready
+                record.waiters = waiters.pending
+                return (oldReport: oldReport, readyWaiters: waiters.ready)
             }
-            readyWaiters.forEach { $0.continuation.resume() }
-            onStart()
+            // Report captures may reenter this recorder from their destructors.
+            // Keep the replaced report alive until its state mutation has unlocked.
+            withExtendedLifetime(output.oldReport) {
+                output.readyWaiters.forEach { $0.continuation.resume() }
+                onStart()
+            }
             return { [self] in
                 let readyWaiters = lock.withLock { record in
                     record.cancelCallsCount += 1

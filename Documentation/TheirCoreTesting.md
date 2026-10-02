@@ -163,6 +163,8 @@ try await cancelRecorder.waitForCancelCallsCount(1)
 
 `Their.TestWorkRecorder<Value, Failure>` records a `Their.Work` start, stores its `Their.WorkReport`, lets tests emit `.value`, `.finished` or `.failure`, and records cancellation. Use it for job and hub tests that need a deterministic upstream.
 
+Starting work again replaces the stored report. Its previous captures stay alive until the recorder lock is released, so a capture's destructor can read the updated start count or emit through the new report. Waiter resumption and `onStart` / `onCancel` callbacks also run outside the lock. The two report-replacement regressions in `TheirCoreTestingTests` exercise lock availability and actual destructor reentry.
+
 ```swift
 let work = Their.TestWorkRecorder<Int, TestError>()
 let job = Their.Job(work: work.work)

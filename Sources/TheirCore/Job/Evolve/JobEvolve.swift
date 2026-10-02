@@ -1,23 +1,24 @@
 import Foundation
 
 /// Single-consumer lifecycle marker for an `EvolvedJobRecord`. Kept private
-/// here rather than as a module-wide enum because no other type depends on it;
+/// here rather than as a TheirCore-wide enum because no other type depends on it;
 /// `JobEngineState` has its own `idle`/`active(cancel:)`/`terminated`.
 private enum EvolvedJobLifecycleState: Sendable {
 
     case pending
     case started
     case terminated
+    case terminating
 }
 
 /// Post-lock action computed by the value branch of `EvolvedJobState.process`.
-/// Carries the sink (and, for a value-driven failure, the live upstream cancel)
+/// Carries the value sink (and, for a value-driven failure, the live upstream cancel)
 /// out of the lock so the emission and the upstream teardown run with the lock
-/// released, like every other side effect in this state machine.
+/// released. A terminal sink stays cancellable until teardown has finished.
 private enum EvolvedJobValueAction<Value: Sendable, Failure: Swift.Error & Sendable>: Sendable {
 
     case emit(sink: Their.JobSink<Value, Failure>, value: Value)
-    case failure(cancel: Their.WorkCancel?, failure: Failure, sink: Their.JobSink<Value, Failure>?)
+    case failure(cancel: Their.WorkCancel?, failure: Failure)
 }
 
 /// Internal vocabulary of an evolution's value transform. Public `evolve` only
@@ -46,14 +47,16 @@ private struct EvolvedJobRecord<
     var sink: Their.JobSink<Value, Failure>?
     var state: State
 
-    /// Detach the complete record so clearing state, closures and pending
-    /// payloads cannot run their destructors under the owner's lock.
-    mutating func terminate(initialState: State) -> Self {
+    /// Detach retired ownership for post-lock release. Terminal processing
+    /// keeps a cancellable sink in the owner until mapping/teardown finishes;
+    /// cancellation closes it immediately instead.
+    mutating func terminate(initialState: State, pendingTerminal: Bool = false) -> Self {
         let detached = self
         _ = inputs.takePending()
         self = Self(
             inputs: inputs,
-            lifecycleState: .terminated,
+            lifecycleState: pendingTerminal ? .terminating : .terminated,
+            sink: pendingTerminal ? detached.sink : nil,
             state: initialState
         )
         return detached
@@ -78,6 +81,12 @@ private struct EvolvedJobRecord<
 /// terminates the lifecycle and additionally cancels the still-live upstream —
 /// unlike an upstream `.finished` / `.failure`, where the source has already terminated
 /// itself and its stored cancel is merely dropped.
+/// Terminal processing first enters `.terminating`: inputs close, while the
+/// owner retains a cancellable terminal sink. Mapping and teardown through an
+/// already-stored upstream cancel run before the final sink claim; a cancel
+/// during either suppresses delivery. A not-yet-stored cancel is invoked when
+/// upstream subscription returns, without delaying terminal delivery.
+/// Claiming that sink changes the state to `.terminated` under the same lock.
 private final class EvolvedJobState<
     Input: Sendable,
     InputFailure: Swift.Error & Sendable,
@@ -116,7 +125,14 @@ private final class EvolvedJobState<
     }
 
     func cancel() {
-        let detached = takeStartedRecord()
+        let detached: EvolvedJobRecord<Input, InputFailure, Value, State, Failure>? = lock.withLock { record in
+            switch record.lifecycleState {
+            case .pending, .terminated:
+                return nil
+            case .started, .terminating:
+                return record.terminate(initialState: initialState)
+            }
+        }
         withExtendedLifetime(detached) {
             detached?.cancel?()
         }
@@ -167,12 +183,15 @@ private final class EvolvedJobState<
         case .finished:
             let detached = takeStartedRecord()
             withExtendedLifetime(detached) {
-                detached?.sink?(.finished)
+                takeTerminalSink()?(.finished)
             }
         case .failure(let inputFailure):
-            let detached = takeStartedRecord()
+            guard let detached = takeStartedRecord() else {
+                return
+            }
             withExtendedLifetime(detached) {
-                detached?.sink?(.failure(failure(inputFailure)))
+                let mappedFailure = failure(inputFailure)
+                takeTerminalSink()?(.failure(mappedFailure))
             }
         case .value(let input):
             var detached: EvolvedJobRecord<Input, InputFailure, Value, State, Failure>?
@@ -190,8 +209,8 @@ private final class EvolvedJobState<
                     }
                     return .emit(sink: sink, value: value)
                 case .failure(let failure):
-                    detached = record.terminate(initialState: initialState)
-                    return .failure(cancel: detached?.cancel, failure: failure, sink: detached?.sink)
+                    detached = record.terminate(initialState: initialState, pendingTerminal: true)
+                    return .failure(cancel: detached?.cancel, failure: failure)
                 case .suppress:
                     record.state = evolvingState
                     return nil
@@ -204,9 +223,9 @@ private final class EvolvedJobState<
                 switch action {
                 case .emit(let sink, let value):
                     sink(.value(value))
-                case .failure(let cancel, let failure, let sink):
+                case .failure(let cancel, let failure):
                     cancel?()
-                    sink?(.failure(failure))
+                    takeTerminalSink()?(.failure(failure))
                 }
             }
         }
@@ -257,7 +276,22 @@ private final class EvolvedJobState<
             guard record.lifecycleState == .started else {
                 return nil
             }
-            return record.terminate(initialState: initialState)
+            return record.terminate(initialState: initialState, pendingTerminal: true)
+        }
+    }
+
+    /// Claim delivery only after user mapping/teardown has returned. A cancel
+    /// during that work changes .terminating to .terminated and clears the sink.
+    /// Once claimed, the callback has the same in-flight ownership as a value.
+    private func takeTerminalSink() -> Their.JobSink<Value, Failure>? {
+        lock.withLock { record in
+            guard record.lifecycleState == .terminating else {
+                return nil
+            }
+            let sink = record.sink
+            record.lifecycleState = .terminated
+            record.sink = nil
+            return sink
         }
     }
 }
@@ -334,15 +368,25 @@ public extension Their.Job {
     /// `MisuseHandler`, with this evolution's creation location in the trace) and
     /// returns an inert cancel without starting a second upstream subscription.
     ///
-    /// Terminal end: an upstream `.finished` is forwarded downstream once, bypassing
-    /// the transform, then the lifecycle terminates exactly like terminal
-    /// failure below. The transform never sees terminal events; a derived
-    /// "last word" belongs to a materialized pipeline, not to `evolve`.
+    /// Terminal end: an upstream `.finished` bypasses the transform and closes the
+    /// lifecycle through the same terminal transition as failure below, then
+    /// claims the downstream sink for one `.finished`. The transform never sees
+    /// terminal events; a derived "last word" belongs to a materialized pipeline,
+    /// not to `evolve`.
     ///
-    /// Terminal failure: an upstream `.failure` is mapped through `failure`, delivered
-    /// once, then the lifecycle terminates — the subscriber and the upstream
-    /// cancel are cleared, queued inputs are dropped and `State` is reset to
-    /// `initial`. Later values, ends or failures are suppressed.
+    /// Terminal failure: an upstream `.failure` closes input, clears the upstream
+    /// cancel, drops queued inputs and resets `State` to `initial`. It then
+    /// maps through `failure` outside the lock and claims the downstream sink for
+    /// one failure. A cancel during mapping clears the pending sink and
+    /// suppresses that terminal callback. Value-driven failures from
+    /// `tryMap` use the same claim after teardown through an already-stored
+    /// upstream cancel, so cancellation reentered from that teardown suppresses
+    /// delivery. If the upstream cancel is not stored yet, the failure may be
+    /// delivered first; the late-returned cancel is invoked when upstream
+    /// subscription returns and cannot suppress an already-delivered callback.
+    /// A callback already claimed by the drainer may finish during concurrent
+    /// cancellation.
+    /// Later values, ends or failures are suppressed.
     ///
     /// Cancel and deinit: cancelling the derived subscription (or releasing the
     /// derived `Job`) cancels the upstream subscription and resets `State`, and

@@ -27,6 +27,91 @@ struct JobTryMapTests {
         }
     }
 
+    /// The throwing report completes on another worker while work still owns
+    /// its unreturned cancel. Terminal delivery must not wait for that handle;
+    /// returning work later cleans it up exactly once.
+    @Test func tryMapConcurrentThrowBeforeWorkReturnsDeliversFailureThenCancels() async throws {
+        try await Their.stress(count: 1) {
+            let onThrowCalls = Their.TestCountRecorder()
+            let recorder = JobTryMapEventRecorder()
+            let reportWorkSlot = Their.Lock<BlockingWork<Void>?>(nil)
+            let trace = Their.TestEventRecorder<String>()
+            let transformCalls = Their.TestCountRecorder()
+            let workEntered = JobTryMapSignal()
+            let workRelease = DispatchSemaphore(value: 0)
+            let workRecorder = Their.TestWorkRecorder<Int, JobTryMapTestsError>(onCancel: {
+                trace.append("cancel")
+            })
+            defer { workRelease.signal() }
+            let upstream = Their.Job { report in
+                let cancel = workRecorder.work(report: report)
+                workEntered.signal()
+                workRelease.wait()
+                return cancel
+            }
+            let mapped: Their.Job<String, JobTryMapTestsError> = upstream.tryMap { _ in
+                _ = transformCalls.increment()
+                throw JobTryMapTestsError.decode
+            } onThrow: { error in
+                _ = onThrowCalls.increment()
+                return (error as? JobTryMapTestsError) ?? .fallback
+            }
+            let subscribeWork = BlockingWork {
+                mapped.subscribe { event in
+                    recorder.append(event)
+                    if case .failure = event {
+                        trace.append("fail")
+                    }
+                }
+            }
+            do {
+                try await workEntered.wait()
+                let reportWork = BlockingWork {
+                    workRecorder.emit(.value(-1))
+                }
+                reportWorkSlot.withLock { $0 = reportWork }
+                try await reportWork.value
+                let cancelsBeforeWorkReturns = workRecorder.cancelCallsCount
+                let eventsBeforeWorkReturns = recorder.events
+                let traceBeforeWorkReturns = trace.events
+
+                workRelease.signal()
+                let cancel = try await subscribeWork.value
+                defer { cancel() }
+                let cancelsAfterSubscribe = workRecorder.cancelCallsCount
+                workRecorder.emit(.value(2))
+                workRecorder.emit(.finished)
+                workRecorder.emit(.failure(.upstream))
+                cancel()
+                cancel()
+
+                #expect(cancelsBeforeWorkReturns == 0)
+                #expect(cancelsAfterSubscribe == 1)
+                #expect(eventsBeforeWorkReturns == [.failure(.decode)])
+                #expect(traceBeforeWorkReturns == ["fail"])
+                #expect(trace.events == ["fail", "cancel"])
+                #expect(recorder.events == [.failure(.decode)])
+                #expect(transformCalls.count == 1)
+                #expect(onThrowCalls.count == 1)
+                #expect(workRecorder.startCallsCount == 1)
+                #expect(workRecorder.cancelCallsCount == 1)
+            } catch {
+                workRelease.signal()
+                // Join both Dispatch workers from an uncancelled task even
+                // when the scenario's timeout has cancelled its async waits.
+                let cleanup = Task {
+                    let cancel = try await subscribeWork.value
+                    cancel()
+                    if let reportWork = reportWorkSlot.withLock({ $0 }) {
+                        try await reportWork.value
+                    }
+                }
+                _ = await cleanup.result
+                throw error
+            }
+        }
+    }
+
     @Test func tryMapDeinitCancelsUpstream() async throws {
         try await Their.stress {
             let driver = JobTryMapDriver()
@@ -110,6 +195,64 @@ struct JobTryMapTests {
             #expect(recorder.events == [.failure(.upstream)])
             #expect(driver.cancelCallsCount == 1)
             #expect(driver.startCallsCount == 1)
+        }
+    }
+
+    /// onThrow runs before the value outcome is committed. Cancelling here
+    /// must discard the mapped failure as well as every later upstream event.
+    @Test func tryMapOnThrowReentrantCancelSuppressesTerminalCallback() async throws {
+        try await Their.stress {
+            let cancelBox = Their.Lock<Their.WorkCancel?>(nil)
+            let onThrowCalls = Their.TestCountRecorder()
+            let recorder = JobTryMapEventRecorder()
+            let reentrantCancelReturns = Their.TestCountRecorder()
+            let trace = Their.TestEventRecorder<String>()
+            let transformCalls = Their.TestCountRecorder()
+            let workRecorder = Their.TestWorkRecorder<Int, JobTryMapTestsError>(onCancel: {
+                trace.append("cancel")
+            })
+            let upstream = Their.Job(work: workRecorder.work)
+            let mapped: Their.Job<String, JobTryMapTestsError> = upstream.tryMap { _ in
+                _ = transformCalls.increment()
+                throw JobTryMapTestsError.decode
+            } onThrow: { error in
+                _ = onThrowCalls.increment()
+                trace.append("onThrow")
+                guard let cancel = cancelBox.withLock({ $0 }) else {
+                    Issue.record("The derived cancel must be stored before the throwing report.")
+                    return .fallback
+                }
+                cancel()
+                _ = reentrantCancelReturns.increment()
+                trace.append("cancel-return")
+                return (error as? JobTryMapTestsError) ?? .fallback
+            }
+            let cancel = mapped.subscribe(recorder.append(_:))
+            cancelBox.withLock { $0 = cancel }
+            defer {
+                let detached = cancelBox.withLock { stored in
+                    let detached = stored
+                    stored = nil
+                    return detached
+                }
+                withExtendedLifetime(detached) {}
+                cancel()
+            }
+
+            workRecorder.emit(.value(-1))
+            workRecorder.emit(.value(2))
+            workRecorder.emit(.finished)
+            workRecorder.emit(.failure(.upstream))
+            cancel()
+            cancel()
+
+            #expect(trace.events == ["onThrow", "cancel", "cancel-return"])
+            #expect(recorder.events.isEmpty == true)
+            #expect(transformCalls.count == 1)
+            #expect(onThrowCalls.count == 1)
+            #expect(reentrantCancelReturns.count == 1)
+            #expect(workRecorder.startCallsCount == 1)
+            #expect(workRecorder.cancelCallsCount == 1)
         }
     }
 
@@ -201,6 +344,59 @@ struct JobTryMapTests {
             ])
             #expect(secondRecorder.events.isEmpty == true)
             #expect(driver.startCallsCount == 1)
+        }
+    }
+
+    /// A synchronous value may throw before subscribe can store the upstream
+    /// cancel. The failure arrives first; the late handle is then cancelled
+    /// exactly once before the derived subscribe returns.
+    @Test func tryMapSynchronousThrowBeforeWorkReturnsDeliversFailureThenCancels() async throws {
+        try await Their.stress {
+            let onThrowCalls = Their.TestCountRecorder()
+            let recorder = JobTryMapEventRecorder()
+            let trace = Their.TestEventRecorder<String>()
+            let transformCalls = Their.TestCountRecorder()
+            let workRecorder = Their.TestWorkRecorder<Int, JobTryMapTestsError>(onCancel: {
+                trace.append("cancel")
+            })
+            let upstream = Their.Job { report in
+                let cancel = workRecorder.work(report: report)
+                report(.value(-1))
+                // Observe the boundary inside work itself: a deferred terminal
+                // after this return must not satisfy the final ordering alone.
+                #expect(recorder.events == [.failure(.decode)])
+                #expect(trace.events == ["fail"])
+                #expect(workRecorder.cancelCallsCount == 0)
+                return cancel
+            }
+            let mapped: Their.Job<String, JobTryMapTestsError> = upstream.tryMap { _ in
+                _ = transformCalls.increment()
+                throw JobTryMapTestsError.decode
+            } onThrow: { error in
+                _ = onThrowCalls.increment()
+                return (error as? JobTryMapTestsError) ?? .fallback
+            }
+            let cancel = mapped.subscribe { event in
+                recorder.append(event)
+                if case .failure = event {
+                    trace.append("fail")
+                }
+            }
+            defer { cancel() }
+            let cancelsAfterSubscribe = workRecorder.cancelCallsCount
+            workRecorder.emit(.value(2))
+            workRecorder.emit(.finished)
+            workRecorder.emit(.failure(.upstream))
+            cancel()
+            cancel()
+
+            #expect(trace.events == ["fail", "cancel"])
+            #expect(cancelsAfterSubscribe == 1)
+            #expect(recorder.events == [.failure(.decode)])
+            #expect(transformCalls.count == 1)
+            #expect(onThrowCalls.count == 1)
+            #expect(workRecorder.startCallsCount == 1)
+            #expect(workRecorder.cancelCallsCount == 1)
         }
     }
 
@@ -308,6 +504,50 @@ struct JobTryMapTests {
             #expect(recorder.events == [.failure(.decode)])
             #expect(driver.cancelCallsCount == 1)
             #expect(driver.startCallsCount == 1)
+        }
+    }
+
+    /// A decoding failure tears down the still-live upstream before delivering
+    /// its terminal callback. That teardown may cancel the derived subscription
+    /// synchronously; a callback that has not started must then be suppressed.
+    @Test func tryMapUpstreamTeardownReentrantCancelSuppressesTerminalCallback() async throws {
+        try await Their.stress {
+            let cancelBox = Their.Lock<Their.WorkCancel?>(nil)
+            let reentrantCancelReturns = Their.TestCountRecorder()
+            let transformCalls = Their.TestCountRecorder()
+            let work = Their.TestWorkRecorder<Int, JobTryMapTestsError>(onCancel: {
+                cancelBox.withLock { $0 }?()
+                _ = reentrantCancelReturns.increment()
+            })
+            let upstream = Their.Job(work: work.work)
+            let recorder = JobTryMapEventRecorder()
+            let mapped: Their.Job<String, JobTryMapTestsError> = upstream.tryMap { _ in
+                _ = transformCalls.increment()
+                throw JobTryMapTestsError.decode
+            } onThrow: { error in
+                (error as? JobTryMapTestsError) ?? .fallback
+            }
+            let cancel = mapped.subscribe(recorder.append(_:))
+            cancelBox.withLock { $0 = cancel }
+            defer {
+                let detached = cancelBox.withLock { stored in
+                    let detached = stored
+                    stored = nil
+                    return detached
+                }
+                withExtendedLifetime(detached) {}
+                cancel()
+            }
+
+            work.emit(.value(-1))
+            work.emit(.value(2))
+            cancel()
+
+            #expect(reentrantCancelReturns.count == 1)
+            #expect(transformCalls.count == 1)
+            #expect(recorder.events.isEmpty == true)
+            #expect(work.cancelCallsCount == 1)
+            #expect(work.startCallsCount == 1)
         }
     }
 }

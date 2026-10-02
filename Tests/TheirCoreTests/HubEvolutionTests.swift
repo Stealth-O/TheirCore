@@ -146,6 +146,37 @@ struct HubEvolutionTests {
         }
     }
 
+
+    @Test func evolveFailureMapperReentrantCancelSuppressesTerminalCallback() async throws {
+        try await Their.stress {
+            let cancelSlot = Their.Lock<Their.HubCancel?>(nil)
+            let eventRecorder = HubEvolutionEventRecorder<Int, HubEvolutionTestsError>()
+            let mapperCalls = Their.TestCountRecorder()
+            let upstream = HubEvolutionHubDriver()
+            let evolved = upstream.hub.mapError { failure in
+                _ = mapperCalls.increment()
+                cancelSlot.withLock { $0 }?()
+                return failure
+            }
+            let cancel = evolved.subscribe(eventRecorder.append(_:))
+            cancelSlot.withLock { $0 = cancel }
+            defer { cancelSlot.withLock { $0 = nil } }
+
+            upstream.emit(failure: .sample)
+
+            #expect(eventRecorder.events.isEmpty)
+            #expect(mapperCalls.count == 1)
+            #expect(upstream.cancelCallsCount == 1)
+            #expect(upstream.startCallsCount == 1)
+            cancel()
+            upstream.emit(value: 2)
+            #expect(eventRecorder.events.isEmpty)
+            #expect(mapperCalls.count == 1)
+            #expect(upstream.cancelCallsCount == 1)
+            withExtendedLifetime(evolved) {}
+        }
+    }
+
     /// Pins the FIFO ordering of terminal failure behind a blocked transform:
     /// the failure is processed by the same single drainer, so it cannot
     /// overtake or interrupt the value being transformed — the value is
@@ -372,6 +403,7 @@ struct HubEvolutionTests {
             #expect(upstream.startCallsCount == 1)
         }
     }
+
 
     @Test func mapErrorTransformsFailureAndPropagatesValue() async throws {
         try await Their.stress {
