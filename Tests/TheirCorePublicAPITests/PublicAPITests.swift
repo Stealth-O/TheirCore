@@ -47,6 +47,30 @@ struct PublicAPITests {
         }
     }
 
+    @Test func deskOwnsStateAndBothSourceKindsFromOutsideThePackage() async throws {
+        try await Their.stress {
+            let desk = Their.Desk([Int]())
+            let job = Their.TestJobDriver<Int, LoadError>()
+            let hub = Their.TestHubDriver<Int, LoadError>()
+            desk.update { $0.append(1) }
+            desk.bind(job.job, id: "save") { state, event in
+                if case .value(let value) = event { state.append(value) }
+            }
+            desk.bind(hub.hub, id: "live") { state, event in
+                if case .value(let value) = event { state.append(value) }
+            }
+            job.emit(value: 2)
+            job.emitFinished()
+            hub.emit(value: 3)
+            desk.unbind("live")
+            #expect(desk.current == [1, 2, 3])
+            let events = Their.TestEventRecorder<Their.HubEvent<[Int], Never>>()
+            let cancel = desk.changes.subscribe(events.append)
+            #expect(events.events == [.value([1, 2, 3])])
+            cancel()
+        }
+    }
+
     @Test func jobEvolvesStateFromValues() async throws {
         try await Their.stress {
             let upstream = Their.TestJobDriver<Int, LoadError>()

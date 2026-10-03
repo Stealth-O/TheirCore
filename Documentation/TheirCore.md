@@ -1,6 +1,6 @@
 # TheirCore
 
-TheirCore holds the lifecycle and concurrency primitives: `Their.Job`, `Their.Hub`, the evolution operators, the stream adapters, `Their.Lock` and a few ownership helpers. It is small on purpose, and it is meant to show the engineering depth expected from any stateful service built on top of it.
+TheirCore holds the lifecycle and concurrency primitives: `Their.Job`, `Their.Hub`, `Their.Desk`, the evolution operators, the stream adapters, `Their.Lock` and a few ownership helpers. It is small on purpose, and it is meant to show the engineering depth expected from any stateful service built on top of it.
 
 Passing tests is not the goal by itself. The goal is to make every important behavior explicit: state, lifecycle, resource ownership, observable events, ignored branches and terminal transitions.
 
@@ -96,6 +96,32 @@ As with `Their.Job`, the behavioral contracts live on the types:
 Delivery order between subscribers of one event is unspecified. The engine registry is a dictionary keyed by `UUID`, so two sinks may receive the same value in either order. Each subscriber still sees events in emit order, and consumer code must not encode subscription order across sinks.
 
 The threading caveats in [Execution and Threading](#execution-and-threading) apply equally to hubs. `Their.HubCancel` cuts delivery synchronously but does not prove that SDK teardown finished, an already running subscriber callback is not interrupted, and derived wrappers do not copy active root `.topLevel` logging.
+
+## Desk Model
+
+`Their.Desk<State>` owns a value snapshot and named source subscriptions for its own lifetime. Its implementation and contract live in `Sources/TheirCore/Desk.swift`; `DeskTests` covers the lifecycle and `PublicAPITests` exercises it without internal access.
+
+The reduction path is a private input Hub → existing `evolve` → snapshot publication → `shareLatest`. A private anchor keeps that path subscribed until Desk release, so detaching all UI observers does not reset state or stop its bound sources. `current` is updated before a new snapshot enters the observation hub. During concurrent updates it may already be newer than a callback's value.
+
+| Operation or event | State and ownership |
+| --- | --- |
+| Construct | Seed `current`; start the private evolution and latest replay |
+| `update` | Queue one pure reducer; emit its result |
+| First or later UI observer | Replay the current snapshot, then live changes |
+| Last UI observer leaves | Preserve state and source bindings |
+| `bind(job/hub, id:)` | Reserve a new generation for this id; cancel the previous binding; start one source subscription |
+| Source value, finish or failure | Queue the event's pure reducer; emit the resulting state if its id/generation is still current |
+| Source terminal event | Retire its cancel handle; preserve its generation so already queued accepted events can still reduce |
+| `unbind`, returned cancel or replacement | Invalidate old queued/future reducers; cancel the retired handle outside locks |
+| Cancel from an old binding | Ignore it if another generation already owns the id |
+| Desk release | Close the registry, cancel sources, finish observers and release the anchor |
+| Subscribe to retained `changes` after Desk release | Finish immediately; do not revive initial state |
+
+The per-id generation fence is checked when a queued reducer is claimed. It suppresses stale callbacks already waiting behind another reducer, including values queued before a source finished. A reducer that passed the fence before cancellation may complete. Starting a subscription is similarly a claimed action: replacement during its start cancels the handle as soon as it is returned. Desk cannot undo IO that has already committed. Domain transactions and checks immediately before irreversible IO stay in the application.
+
+Binding ids should be stable feature names, such as `"reload"` or `"submission"`. Small generation tombstones remain until Desk release so a cancel from a completed binding can still fence its queued results. Do not allocate a fresh id per event. Dropping a returned cancel leaves the Desk-owned binding active. Weak captures are needed when reducers or observers refer back to their Desk or feature owner; caller-created strong ownership cycles remain the caller's responsibility.
+
+There is no actor confinement or implicit scheduler. Reduction is serialized by `evolve`; uncontended calls drain inline, while concurrent and reentrant calls may return before their queued work applies. UI bridges enter their actor and can read `current` there to avoid applying an outdated captured snapshot. No user reducer, sink, source cancel or retired capture destructor runs under a Desk lock. Desk introduces no new `@unchecked Sendable` declarations and leaves the Job/Hub/evolution contracts intact.
 
 ## Execution and Threading
 
@@ -193,7 +219,7 @@ A scenario that holds a drainer inside a sink or transform, for example with a `
 
 ### Lifetime Cleanup Contract
 
-The cleanup paths covered here are subscription pins and sink slots, `JobEngine` input cleanup, job evolution, hub evolution, merge, weak-cache pruning and replacement of logging outputs and diagnostic hooks. They detach retired callbacks, state and discarded inputs under the corresponding lock, then release those references after unlocking, so destructors may synchronously re-enter cancellation or lookup. Releasing the last facade reference of a job or hub subscription pin must not run upstream teardown under the pin lock.
+The cleanup paths covered here are Desk snapshots and bindings, subscription pins and sink slots, `JobEngine` input cleanup, job evolution, hub evolution, merge, weak-cache pruning and replacement of logging outputs and diagnostic hooks. They detach retired callbacks, state and discarded inputs under the corresponding lock, then release those references after unlocking, so destructors may synchronously re-enter cancellation or lookup. Releasing the last facade reference of a job or hub subscription pin must not run upstream teardown under the pin lock.
 
 A job's sink slot moves through `open`, `subscribed` and `closed`. Taking or clearing it closes the slot permanently before root-engine teardown. A destructor may attempt to subscribe again through a nonfatal misuse handler, but the rejected subscription never acquires a sink.
 
@@ -205,6 +231,7 @@ A hub subscription drops its sink reference on cancel, finish or failure. Keepin
 
 Regression coverage:
 
+- `DeskTests`: state across UI lifecycles, generation fencing of queued reducers, synchronous terminal and late-start cleanup, source cancellation reentry, reducer capture release, snapshot destructor reentry and owner release with retained external handles.
 - `JobSubscriptionLifetimeTests` and `HubSubscriptionLifetimeTests`: the real public cancel and pin paths, weak task-local lock probes, and upstream teardown re-entering the same cancel.
 - `JobEvolutionLifetimeTests`, `HubEvolutionLifetimeTests` and `JobMergeLifetimeTests`: destructors of state, replay values, sinks and discarded inputs across cancel, finish, failure, transform failure, unsubscribing a subscriber that is not the last, replacement and reentrant cleanup. DEBUG-only construction seams use the actual private state machines without exposing public facade state.
 - `HubCaptureLifetimeTests` and `HubEngineSubscriptionTests`: captures released while the cancel handle remains alive, terminal cleanup, callback-driven cancellation, and captures retained only until an in-flight callback returns.
@@ -226,7 +253,7 @@ Every test already runs its scenario many times concurrently through `Their.stre
 
 ## Known Gaps and Missing Operators
 
-`Their.Job` and `Their.Hub` are the two primitives. Their axis is subscriber cardinality, one owner or many, and there is no third value on that axis, so a third peer primitive is not the gap. The gaps are operators, in priority order:
+`Their.Job` and `Their.Hub` cover subscriber cardinality: one subscriber or many. `Their.Desk` owns state and bindings across observation lifecycles, using the existing Hub evolution. The remaining gaps are operators, in priority order:
 
 - Multi-upstream readiness operators such as `combineLatest`, `withLatestFrom` or `zip`. `Their.Job.merge` covers the union of same-typed event streams and should be paired with `evolve` for reducer-owned state. Readiness policies such as "wait for the latest value of every upstream", "sample another upstream" or "pair values by position" are still absent. Add them as operators with full lifecycle tests when a second real case needs that specific policy, not as local callback bags.
 - Materialization with `materialize()` and `dematerialize()`, for reducer-owned terminal policy such as "the first finish of an important source terminates the whole merged pipeline" or errors as data from sources you do not own. Add the pair on top of `.finished`: `materialize` duplicates the upstream terminal event as a final data marker and then genuinely finishes, and `dematerialize` turns marker output back into a real terminal event and cancels its upstream, which cascades through `merge`. Keep `evolve` untouched: a "last word" or flush belongs to the materialized output alphabet, not to a second transform parameter.
