@@ -99,29 +99,37 @@ The threading caveats in [Execution and Threading](#execution-and-threading) app
 
 ## Desk Model
 
-`Their.Desk<State>` owns a value snapshot and named source subscriptions for its own lifetime. Its implementation and contract live in `Sources/TheirCore/Desk.swift`; `DeskTests` covers the lifecycle and `PublicAPITests` exercises it without internal access.
+`Their.Desk<State, Event>` owns a value snapshot and named source subscriptions for its own lifetime. One `@Sendable (inout State, Event) -> Void` reducer is required at construction and cannot be replaced. Its implementation and contract live in `Sources/TheirCore/Desk.swift`; `DeskTests` covers the lifecycle and `PublicAPITests` exercises it without internal access.
 
-The reduction path is a private input Hub → existing `evolve` → snapshot publication → `shareLatest`. A private anchor keeps that path subscribed until Desk release, so detaching all UI observers does not reset state or stop its bound sources. `current` is updated before a new snapshot enters the observation hub. During concurrent updates it may already be newer than a callback's value.
+The state transition boundary is `Event → fixed reducer → State`. `send(Event)` and source mappings enter the same private input Hub → existing `evolve` → snapshot publication → `shareLatest` path. Queued inputs contain event data and optional binding identity, never another state-mutating closure. `bind` only translates a Job/Hub input to `Event?`; it has no mutable State argument. Returning `nil` skips reduction and publication. Every accepted event invokes the fixed reducer exactly once and emits its snapshot, even when the state is unchanged. Initial publication and replay bypass the reducer.
+
+A private anchor keeps this path subscribed until Desk release, so detaching all external observers does not reset state or stop bound sources. `changes` is the snapshot output, and `current` is its read-only retained value. `current` is updated before a new snapshot enters the observation hub; concurrent sends can make it newer than a callback's value. State must have value semantics. Swift's `Sendable` constraint does not enforce reducer purity or prevent aliases to shared mutable reference storage.
 
 | Operation or event | State and ownership |
 | --- | --- |
-| Construct | Seed `current`; start the private evolution and latest replay |
-| `update` | Queue one pure reducer; emit its result |
-| First or later UI observer | Replay the current snapshot, then live changes |
-| Last UI observer leaves | Preserve state and source bindings |
+| Construct | Fix the reducer, seed `current`, start the private evolution and latest replay |
+| `send(event)` | Queue one typed event; apply the fixed reducer; emit its result |
+| First or later observer | Replay the latest snapshot, then live changes |
+| Last external observer leaves | Preserve state and source bindings |
 | `bind(job/hub, id:)` | Reserve a new generation for this id; cancel the previous binding; start one source subscription |
-| Source value, finish or failure | Queue the event's pure reducer; emit the resulting state if its id/generation is still current |
-| Source terminal event | Retire its cancel handle; preserve its generation so already queued accepted events can still reduce |
-| `unbind`, returned cancel or replacement | Invalidate old queued/future reducers; cancel the retired handle outside locks |
+| Source value, finish or failure | Map to `Event?`; queue a non-nil event; invoke the fixed reducer only if its id/generation is still current |
+| Source terminal event | Retire its cancel handle even if mapped to nil; preserve its generation so already queued events can still reduce |
+| `unbind`, returned cancel or replacement | Invalidate old queued/future events; cancel the retired handle outside locks; do not change state directly |
 | Cancel from an old binding | Ignore it if another generation already owns the id |
 | Desk release | Close the registry, cancel sources, finish observers and release the anchor |
 | Subscribe to retained `changes` after Desk release | Finish immediately; do not revive initial state |
 
-The per-id generation fence is checked when a queued reducer is claimed. It suppresses stale callbacks already waiting behind another reducer, including values queued before a source finished. A reducer that passed the fence before cancellation may complete. Starting a subscription is similarly a claimed action: replacement during its start cancels the handle as soon as it is returned. Desk cannot undo IO that has already committed. Domain transactions and checks immediately before irreversible IO stay in the application.
+The per-id generation fence is checked before mapping starts and again when its queued event is claimed for reduction. The latter check suppresses stale events already waiting behind another event, including values queued before a source finished or returned by a mapping that was in flight during replacement. An event that passed the reduction fence before cancellation may complete. Starting a subscription is similarly a claimed action: replacement during its start cancels the handle as soon as it is returned. Desk cannot undo IO that has already committed. Domain transactions and checks immediately before irreversible IO stay in the application.
 
-Binding ids should be stable feature names, such as `"reload"` or `"submission"`. Small generation tombstones remain until Desk release so a cancel from a completed binding can still fence its queued results. Do not allocate a fresh id per event. Dropping a returned cancel leaves the Desk-owned binding active. Weak captures are needed when reducers or observers refer back to their Desk or feature owner; caller-created strong ownership cycles remain the caller's responsibility.
+Binding ids should be stable feature names, such as `"reload"` or `"submission"`. Small generation tombstones remain until Desk release so a cancel from a completed binding can still fence its queued results. Do not allocate a fresh id per event. Dropping a returned cancel leaves the Desk-owned binding active. Binding cancellation controls source ownership; represent a domain cancellation state change with an explicit Event and the fixed reducer.
 
-There is no actor confinement or implicit scheduler. Reduction is serialized by `evolve`; uncontended calls drain inline, while concurrent and reentrant calls may return before their queued work applies. UI bridges enter their actor and can read `current` there to avoid applying an outdated captured snapshot. No user reducer, sink, source cancel or retired capture destructor runs under a Desk lock. Desk introduces no new `@unchecked Sendable` declarations and leaves the Job/Hub/evolution contracts intact.
+Source mapping captures retire with their subscriptions; an already running callback can retain them until it returns. A queued typed event does not retain its mapping closure, but its own payload stays alive until processing or queue cleanup. The fixed reducer belongs to the evolution pipeline, which can be retained through `changes`. Use weak captures when the reducer, a mapping or an observer refers back to its Desk or feature owner; caller-created strong ownership cycles remain the caller's responsibility.
+
+There is no actor confinement or implicit scheduler. Reduction is serialized by `evolve` on the current drainer's thread; uncontended sends drain inline, while concurrent and reentrant sends may return before their queued events apply. FIFO means admission order at the private input Hub, not a total wall-clock order across producers. Source mappings execute before admission and can run concurrently across bindings. Keep both the reducer and mappings pure and short. No user reducer, mapping, sink, source cancel or retired capture destructor runs under a Desk lock. Desk introduces no new `@unchecked Sendable` declarations and leaves the Job/Hub/evolution contracts intact.
+
+### Migrating Desk from 0.2.0
+
+Declare the feature's Event type and move all state transitions into the one constructor reducer. Replace `update { state in ... }` with `send(event)`. Change each `bind` closure from `(inout State, SourceEvent) -> Void` to `(SourceEvent) -> Event?`; explicitly map terminal inputs if they should change domain state, otherwise return nil. The public `update` and per-binding mutable-state signatures have been removed. `current` remains read-only and `changes` remains a snapshot Hub. The existing source evolution operators are unchanged and cannot mutate a Desk's owned state.
 
 ## Execution and Threading
 

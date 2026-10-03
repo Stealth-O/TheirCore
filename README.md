@@ -15,7 +15,7 @@ It was extracted from an app whose features are mostly written by coding agents.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Stealth-O/TheirCore.git", from: "0.2.0")
+    .package(url: "https://github.com/Stealth-O/TheirCore.git", exact: "0.3.0")
 ],
 targets: [
     .target(name: "App", dependencies: ["TheirCore"]),
@@ -29,7 +29,7 @@ targets: [
 | --- | --- |
 | `Their.Job` | One finite lifecycle with one subscriber: values, then `.finished` or `.failure`. |
 | `Their.Hub` | One shared lifecycle for many subscribers. The last subscriber to leave stops it. |
-| `Their.Desk` | Retained state, latest snapshots and named Job/Hub bindings, independent of UI subscribers. |
+| `Their.Desk` | Typed events, one fixed state reducer, retained snapshots and named Job/Hub bindings. |
 | `evolve`, `map`, `mapError`, `tryMap` | Derive values and state from a job or a hub through one reducer. |
 | `Their.Job.merge`, `shareLatest()`, `job()` | A union of jobs, latest-value replay, and a hub-to-job bridge. |
 | `stream()` | An `AsyncStream` adapter that subscribes before it returns. |
@@ -104,32 +104,47 @@ let ticker = prices.subscribe { event in /* ... */ } // Same feed, starts from t
 ### Keep state on a desk
 
 ```swift
-struct ScreenState: Sendable {
-    var total = 0
+struct FeatureState: Sendable {
     var failure: LoadError?
+    var total = 0
 }
 
-let desk = Their.Desk(ScreenState())
-desk.update { $0.total = 10 }
-desk.bind(numbers, id: "numbers") { state, event in
+enum FeatureEvent: Sendable {
+    case loadFailed(LoadError)
+    case numberReceived(Int)
+    case totalSet(Int)
+}
+
+let desk = Their.Desk<FeatureState, FeatureEvent>(FeatureState()) { state, event in
     switch event {
-    case .value(let value): state.total += value
-    case .failure(let failure): state.failure = failure
-    case .finished: break
+    case .totalSet(let total): state.total = total
+    case .numberReceived(let value): state.total += value
+    case .loadFailed(let failure): state.failure = failure
     }
 }
 
-let cancelUI = desk.changes.subscribe { event in /* Render on your UI actor. */ }
-cancelUI()                       // State and bindings keep running.
-let snapshot = desk.current
+desk.send(.totalSet(10))
+desk.bind(numbers, id: "numbers") { event in
+    switch event {
+    case .value(let value): return .numberReceived(value)
+    case .failure(let failure): return .loadFailed(failure)
+    case .finished: return nil
+    }
+}
+
+let cancel = desk.changes.subscribe { event in /* Consume snapshots. */ }
+cancel()                         // State and bindings keep running.
+let snapshot = desk.current      // Read-only value snapshot.
 desk.unbind("numbers")            // Stops this binding; keeps its last state.
 ```
 
-`numbers` can be a Job or a Hub. Binding another source under the same id cancels the old subscription and fences its queued reducers. A source's terminal event reaches the reducer and retires that binding, while the Desk remains usable. Retain Desk in the feature owner; it owns binding cancellations even when their returned handles are discarded. Use weak captures when a stored reducer or observer refers back to that owner.
+`Desk<State, Event>` fixes one reducer at construction. Its only state transition path is `Event → reducer → State`: `send` queues a typed event, and `bind` maps a Job or Hub input into the same event type. Bindings never receive mutable state or install another reducer. A mapping can return `nil` to ignore an input without reduction or publication. A source terminal still retires its binding, whether it maps to an event or to `nil`.
 
-Desk reuses `Hub.evolve` for FIFO reduction and keeps an internal observer until Desk release. The existing evolution still resets at the end of its own lifecycle. Desk adds state ownership rather than another reducer engine. Reducers stay pure; database writes and other effects belong in Jobs or application services.
+Binding another source under the same id cancels the old subscription and fences its queued events before reduction. An event already claimed by the reducer can finish. Retain Desk in the feature owner; it owns binding cancellations even when their returned handles are discarded. Use weak captures when a stored reducer, source mapping or observer refers back to that owner.
 
-There is no implicit scheduler. Serial, uncontended updates drain inline; a concurrent or reentrant call can return while its update is queued. When bridging to an actor, reading `desk.current` after the hop avoids rendering a captured snapshot that has already been superseded. Releasing Desk cancels bindings and finishes current observers; retaining `changes` does not keep Desk alive.
+Desk reuses `Hub.evolve` for FIFO reduction and keeps an internal observer until Desk release. The existing evolution still resets at the end of its own lifecycle. Desk adds state ownership rather than another reducer engine. Keep the reducer and source mappings pure and short; database writes and other effects belong in Jobs or application services. State must have value semantics: `Sendable` alone does not stop a caller from mutating shared reference storage.
+
+There is no implicit scheduler or actor confinement. An uncontended `send` drains inline; a concurrent or reentrant call can return while its event is queued. The current drainer processes events in queue admission order. Source mappings execute before admission and can run concurrently across bindings. `current` is updated before snapshot publication, but a concurrent send can make it newer than an observer's captured snapshot. Releasing Desk cancels bindings and finishes current observers; retaining `changes` does not keep Desk alive.
 
 ### Streams and one-shot work
 
@@ -180,6 +195,14 @@ import TheirCoreTesting
 - Reports enter a FIFO queue that one caller drains at a time, so a terminal event never overtakes values reported before it.
 - Nothing hops threads. Callbacks run on the thread that reported the event, so hop to the main actor yourself before touching UI.
 - Subscribing twice to a `Their.Job`, or another incorrect use, is reported as `Their.Misuse`. The default handler stops the process.
+
+## 0.3.0
+
+Makes Desk's state transitions explicit: `Their.Desk<State, Event>` requires one reducer at construction, `send(Event)` replaces `update`, and Job/Hub bindings only map source inputs to `Event?`. The same FIFO and fixed reducer process every accepted event. Initial replay and ignored inputs do not invoke the reducer. Cancellation, named replacement and Desk lifetime keep their existing guarantees.
+
+This is a breaking Desk API change. Move former `update` closures and per-binding state mutations into cases of one feature event and its constructor reducer. Replace each `update` call with `send`, and each binding reducer with a source-to-event mapping. There is no mutable-state compatibility entry point. Existing consumers pinned to 0.2.0 can migrate separately; Job, Hub, `evolve` and TheirCoreTesting retain their contracts.
+
+Validated with Swift 6.3.3: **461 tests in 37 suites** and a Release build. The regression coverage includes mixed direct/Job/Hub FIFO delivery, ignored terminals, replacement during mapping, reentrant mapping and release of mapping captures while typed events remain queued, alongside the existing Desk lifecycle scenarios. Public-consumer compilation verifies the new API; compiler checks also reject `update`, mutable binding reducers, assignment to `current` or `changes`, and events of the wrong type.
 
 ## 0.2.0
 
