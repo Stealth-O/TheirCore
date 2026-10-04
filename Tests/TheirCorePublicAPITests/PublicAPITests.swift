@@ -51,6 +51,22 @@ struct PublicAPITests {
         }
     }
 
+    @Test func firstValueAndItsPoliciesArePublicConsumerAPI() async throws {
+        try await Their.stress {
+            let cancellation: Their.JobAwaitCancellation = .awaitResult
+            let job = Their.Job<Int, LoadError> { report in
+                report(.value(1)); report(.value(2)); report(.finished)
+                return {}
+            }
+            let value = try await job.firstValue(cancellation: cancellation, where: { $0 == 2 })
+            #expect(value == 2)
+            let empty = Their.Job<Int, Never> { report in report(.finished); return {} }
+            do { _ = try await empty.firstValue(); Issue.record("Expected missing value") }
+            catch { #expect(error is Their.JobValueUnavailable) }
+            _ = Their.JobValueUnavailable()
+        }
+    }
+
     @Test func hubSharesOneLifecycleAndReplaysTheLatestValue() async throws {
         try await Their.stress {
             let upstream = Their.TestHubDriver<Int, LoadError>()

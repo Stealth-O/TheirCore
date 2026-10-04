@@ -34,6 +34,7 @@ That is why the one-owner lifecycle stack is layered as:
 - `Their.Resource`: a small owner for one SDK or resource handle that must be released exactly once.
 - `Their.Job`: the public sink-based facade.
 - `stream()`: an `AsyncStream` adapter over that facade.
+- `firstValue(cancellation:where:)`: one async matching result over that facade, with an explicit cancellation policy.
 
 The stream is not the foundation. The state machine is.
 
@@ -96,6 +97,43 @@ As with `Their.Job`, the behavioral contracts live on the types:
 Delivery order between subscribers of one event is unspecified. The engine registry is a dictionary keyed by `UUID`, so two sinks may receive the same value in either order. Each subscriber still sees events in emit order, and consumer code must not encode subscription order across sinks.
 
 The threading caveats in [Execution and Threading](#execution-and-threading) apply equally to hubs. `Their.HubCancel` cuts delivery synchronously but does not prove that SDK teardown finished, an already running subscriber callback is not interrupted, and derived wrappers do not copy active root `.topLevel` logging.
+
+## Awaiting One Job Value
+
+`Their.Job.firstValue(cancellation:where:)` bridges one existing, single-use job
+to a throwing async result without adding an AsyncStream lifecycle. Its source
+contract is in `Sources/TheirCore/Job/Once/JobFirstValue.swift` and is exercised by
+`JobFirstValueTests` and the public-consumer test target.
+
+The waiter holds one continuation, the first selected result and a
+`Their.Resource<Their.WorkCancel>` subscription owner. Result selection is one
+small `Their.Lock` transition; the predicate, resource cancellation and resumed
+continuation run outside the lock. Synchronous source delivery can select a
+result before `subscribe` returns: the Resource immediately releases that late
+handle rather than losing it.
+
+| Input/state | Outcome |
+| --- | --- |
+| Task cancelled on entry | Throw `CancellationError`; do not subscribe, for either policy |
+| Nonmatching value | Keep waiting |
+| First matching value | Return that value; release the subscription |
+| Source failure before match | Throw that original error; release the subscription |
+| Source finishes before match | Throw `Their.JobValueUnavailable`; release the subscription |
+| Task cancellation, `cancelSource` | Select cancellation if no result won yet; release the subscription |
+| Task cancellation after entry, `awaitResult` | Keep waiting for the source's matching value or terminal outcome |
+| Any later outcome or cancellation | Preserve the selected result; no second resumption or teardown |
+
+`awaitResult` is for bounded operations whose receipt must survive cancellation,
+for example a command already submitted to a device. It does not start a detached
+task, clear `Task.isCancelled`, impose a deadline or guarantee an outcome from an
+endless source. The caller must choose a source with its own bounded terminal
+behavior and persist the returned acknowledgement before the next cancellable
+suspension. Ordinary reads use `cancelSource`.
+
+The predicate runs on the reporting thread and should be short. A predicate
+already executing when cancellation wins may finish, but cannot replace that
+outcome. This adapter preserves Job's single-subscriber misuse rules; every
+independent await needs a fresh Job, just as every independent subscription does.
 
 ## Desk Model
 

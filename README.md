@@ -15,7 +15,7 @@ It was extracted from an app whose features are mostly written by coding agents.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Stealth-O/TheirCore.git", exact: "0.3.0")
+    .package(url: "https://github.com/Stealth-O/TheirCore.git", exact: "0.4.0")
 ],
 targets: [
     .target(name: "App", dependencies: ["TheirCore"]),
@@ -33,6 +33,7 @@ targets: [
 | `evolve`, `map`, `mapError`, `tryMap` | Derive values and state from a job or a hub through one reducer. |
 | `Their.Job.merge`, `shareLatest()`, `job()` | A union of jobs, latest-value replay, and a hub-to-job bridge. |
 | `stream()` | An `AsyncStream` adapter that subscribes before it returns. |
+| `firstValue(cancellation:where:)` | Await one matching value, with ordinary cancellation or a bounded committed-result policy. |
 | `Their.Job.once`, `Their.Job.never()` | One async operation as a job, and an inert job for defaults and previews. |
 | `Their.Work`, `Their.serialized` | The producer side: report values, finish or fail, return a cancel. |
 | `Their.Resource`, `Their.Lock` | Ownership of one external handle, and a mutex with the `Synchronization.Mutex` API. |
@@ -158,6 +159,21 @@ for await event in profile.stream() {
 }
 ```
 
+### Await one result
+
+```swift
+let profileValue = try await profile.firstValue()
+let receipt = try await submittedCommand.firstValue(cancellation: .awaitResult)
+```
+
+The default cancels its subscription when the waiting task is cancelled.
+`awaitResult` keeps a bounded operation pinned until a matching value or terminal
+event so cancellation cannot discard an acknowledgement. An already-cancelled
+task never starts either policy. A failure is thrown unchanged; finishing without
+a match throws `Their.JobValueUnavailable`. The method does not clear the task's
+cancellation flag or impose a timeout. Use `awaitResult` only when the source has
+its own bounded outcome; ordinary reads use the default.
+
 ### Testing
 
 ```swift
@@ -195,6 +211,22 @@ import TheirCoreTesting
 - Reports enter a FIFO queue that one caller drains at a time, so a terminal event never overtakes values reported before it.
 - Nothing hops threads. Callbacks run on the thread that reported the event, so hop to the main actor yourself before touching UI.
 - Subscribing twice to a `Their.Job`, or another incorrect use, is reported as `Their.Misuse`. The default handler stops the process.
+
+## 0.4.0
+
+Adds `Their.Job.firstValue(cancellation:where:)`, `Their.JobAwaitCancellation`
+and `Their.JobValueUnavailable`. The adapter uses the existing Job subscription,
+Lock and Resource owners, preserving single-subscriber enforcement and exact
+cleanup even for synchronous results or a late-returned cancel handle. Existing
+Job, Hub, Desk and stream call sites remain unchanged.
+
+Validated with Swift 6.3.3: **13 targeted tests in 2 suites**, the complete
+**474 tests in 38 suites**, and a Release build. All scenarios use `Their.stress`.
+Coverage includes cancellation before registration, synchronous late handles,
+cancellation/value races, retained acknowledgements and failures, predicate
+filtering, empty finish and reentrant teardown. Public-consumer compilation
+verifies the names without `@testable import`. The installation example targets
+0.4.0; publishing this candidate remains the release step after review.
 
 ## 0.3.0
 
