@@ -19,31 +19,31 @@ extension Their {
     /// in Jobs or application services. State must be a value snapshot: Sendable
     /// alone does not prevent shared reference storage from being mutated elsewhere.
     ///
-    /// Releasing Desk cancels its bindings and finishes existing `changes`
-    /// subscribers. Retaining `changes` or a binding's cancel does not retain Desk.
-    public final class Desk<State: Sendable, Event: Sendable>: Sendable {
+    /// Releasing Box cancels its bindings and finishes existing `changes`
+    /// subscribers. Retaining `changes` or a binding's cancel does not retain Box.
+    public final class Box<State: Sendable, Event: Sendable>: Sendable {
 
         private let anchor: Their.HubCancel
-        private let bindings: DeskBindings<Event>
+        private let bindings: BoxBindings<Event>
         public let changes: Their.Hub<State, Never>
         public var current: State { snapshot.current }
-        private let snapshot: DeskSnapshot<State>
-        private let source: DeskSource<Event>
+        private let snapshot: BoxSnapshot<State>
+        private let source: BoxSource<Event>
 
-        /// Fixes the only state reducer for the lifetime of this Desk.
+        /// Fixes the only state reducer for the lifetime of this Box.
         /// Initial snapshot publication does not invoke the reducer. Every accepted
         /// event invokes it once and emits the resulting snapshot, even if unchanged.
         public init(
             _ initial: State,
             reducer: @escaping @Sendable (inout State, Event) -> Void
         ) {
-            let snapshot = DeskSnapshot(initial)
-            let source = DeskSource<Event>()
-            let bindings = DeskBindings(source: source)
+            let snapshot = BoxSnapshot(initial)
+            let source = BoxSource<Event>()
+            let bindings = BoxBindings(source: source)
             self.snapshot = snapshot
             self.source = source
             self.bindings = bindings
-            changes = Their.Hub<DeskInput<Event>, Never>(work: source.connect(_:))
+            changes = Their.Hub<BoxInput<Event>, Never>(work: source.connect(_:))
                 .evolve(initial: initial) { [weak bindings] state, input -> State? in
                     switch input {
                     case .publish:
@@ -73,7 +73,7 @@ extension Their {
         }
 
         /// Starts one fresh Job and owns its subscription until terminal delivery,
-        /// cancellation, replacement under the same id, or Desk release. The mapping
+        /// cancellation, replacement under the same id, or Box release. The mapping
         /// returns a typed event for the fixed reducer, or nil to ignore the input.
         /// A terminal input retires the binding even when its mapping returns nil.
         /// Dropping the returned cancel does not cancel the binding; an old cancel
@@ -92,7 +92,7 @@ extension Their {
 
         /// Owns one subscription to a shared Hub, with the same event-mapping
         /// contract as the Job overload. Terminal delivery retires this binding;
-        /// it does not reset Desk or restart the source automatically.
+        /// it does not reset Box or restart the source automatically.
         @discardableResult
         public func bind<Value: Sendable, Failure: Swift.Error & Sendable>(
             _ hub: Their.Hub<Value, Failure>,
@@ -118,17 +118,17 @@ extension Their {
     }
 }
 
-private struct DeskBinding: Sendable {
+private struct BoxBinding: Sendable {
     let generation: UInt64
     let id: String
 }
 
-private enum DeskInput<Event: Sendable>: Sendable {
-    case event(Event, binding: DeskBinding?)
+private enum BoxInput<Event: Sendable>: Sendable {
+    case event(Event, binding: BoxBinding?)
     case publish
 }
 
-private final class DeskSnapshot<State: Sendable>: Sendable {
+private final class BoxSnapshot<State: Sendable>: Sendable {
     var current: State { lock.withLock { $0 } }
     private let lock: Their.Lock<State>
 
@@ -144,16 +144,16 @@ private final class DeskSnapshot<State: Sendable>: Sendable {
     }
 }
 
-/// This private source has one lifecycle, pinned by Desk's anchor. Once closed,
+/// This private source has one lifecycle, pinned by Box's anchor. Once closed,
 /// later attempts to subscribe finish immediately instead of reviving initial state.
-private final class DeskSource<Event: Sendable>: Sendable {
+private final class BoxSource<Event: Sendable>: Sendable {
     private struct Record: Sendable {
         var isClosed = false
-        var report: Their.WorkReport<DeskInput<Event>, Never>?
+        var report: Their.WorkReport<BoxInput<Event>, Never>?
     }
     private let lock = Their.Lock(Record())
 
-    func connect(_ report: @escaping Their.WorkReport<DeskInput<Event>, Never>) -> Their.WorkCancel {
+    func connect(_ report: @escaping Their.WorkReport<BoxInput<Event>, Never>) -> Their.WorkCancel {
         let connected = lock.withLock { record in
             guard !record.isClosed else { return false }
             record.report = report
@@ -182,13 +182,13 @@ private final class DeskSource<Event: Sendable>: Sendable {
         report?(.finished)
     }
 
-    func send(_ input: DeskInput<Event>) {
+    func send(_ input: BoxInput<Event>) {
         let report = lock.withLock { $0.report }
         report?(.value(input))
     }
 }
 
-private final class DeskBindings<Event: Sendable>: Sendable {
+private final class BoxBindings<Event: Sendable>: Sendable {
     private struct Slot: Sendable {
         let cancellation: Their.Resource<Their.WorkCancel>
         let generation: UInt64
@@ -196,16 +196,16 @@ private final class DeskBindings<Event: Sendable>: Sendable {
     private struct Record: Sendable {
         // Keep the latest token after terminal delivery so previously queued
         // terminal/value events remain valid. Stable feature ids are intended;
-        // these small tombstones live until Desk release.
+        // these small tombstones live until Box release.
         var generations: [String: UInt64] = [:]
         var isClosed = false
         var nextGeneration: UInt64 = 0
         var slots: [String: Slot] = [:]
     }
     private let lock = Their.Lock(Record())
-    private let source: DeskSource<Event>
+    private let source: BoxSource<Event>
 
-    init(source: DeskSource<Event>) { self.source = source }
+    init(source: BoxSource<Event>) { self.source = source }
 
     func bind<SourceEvent: Sendable>(
         id: String,
@@ -224,7 +224,7 @@ private final class DeskBindings<Event: Sendable>: Sendable {
         guard let reservation else { return {} }
         reservation.retired?.cancellation.cancel()
         let generation = reservation.slot.generation
-        let binding = DeskBinding(generation: generation, id: id)
+        let binding = BoxBinding(generation: generation, id: id)
         if isCurrent(binding) {
             let cancel = subscribe { [weak self] event in
                 guard let self, isCurrent(binding) else { return }
@@ -270,7 +270,7 @@ private final class DeskBindings<Event: Sendable>: Sendable {
         retired?.cancellation.cancel()
     }
 
-    func isCurrent(_ binding: DeskBinding) -> Bool {
+    func isCurrent(_ binding: BoxBinding) -> Bool {
         lock.withLock { !$0.isClosed && $0.generations[binding.id] == binding.generation }
     }
 }

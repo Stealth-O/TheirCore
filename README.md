@@ -2,7 +2,7 @@
 
 *Nothing here is mine. It's all theirs.*
 
-TheirCore is a small set of lifecycle and concurrency primitives for Swift 6: a single-owner `Their.Job`, a shared multi-subscriber `Their.Hub`, a persistent state owner `Their.Desk`, reducers that derive state from their events, `AsyncStream` adapters, a lock and a few ownership helpers. TheirCoreTesting is the test kit those primitives are verified with.
+TheirCore is a small set of lifecycle and concurrency primitives for Swift 6: a single-owner `Their.Job`, a shared multi-subscriber `Their.Hub`, an in-memory state owner `Their.Box`, reducers that derive state from their events, `AsyncStream` adapters, a lock and a few ownership helpers. TheirCoreTesting is the test kit those primitives are verified with.
 
 It was extracted from an app whose features are mostly written by coding agents. Agents do better with a handful of deeply tested primitives and written lifecycle rules than with a fresh mix of callback bags, actors and hand-rolled streams in every feature. So the features are theirs, and so is everything they are built on: every public name lives in the `Their` namespace.
 
@@ -15,7 +15,7 @@ It was extracted from an app whose features are mostly written by coding agents.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Stealth-O/TheirCore.git", exact: "0.4.0")
+    .package(url: "https://github.com/Stealth-O/TheirCore.git", exact: "0.5.0")
 ],
 targets: [
     .target(name: "App", dependencies: ["TheirCore"]),
@@ -29,7 +29,7 @@ targets: [
 | --- | --- |
 | `Their.Job` | One finite lifecycle with one subscriber: values, then `.finished` or `.failure`. |
 | `Their.Hub` | One shared lifecycle for many subscribers. The last subscriber to leave stops it. |
-| `Their.Desk` | Typed events, one fixed state reducer, retained snapshots and named Job/Hub bindings. |
+| `Their.Box` | Typed events, one fixed state reducer, retained snapshots and named Job/Hub bindings. |
 | `evolve`, `map`, `mapError`, `tryMap` | Derive values and state from a job or a hub through one reducer. |
 | `Their.Job.merge`, `shareLatest()`, `job()` | A union of jobs, latest-value replay, and a hub-to-job bridge. |
 | `stream()` | An `AsyncStream` adapter that subscribes before it returns. |
@@ -102,7 +102,7 @@ let chart = prices.subscribe { event in /* ... */ }
 let ticker = prices.subscribe { event in /* ... */ } // Same feed, starts from the latest price.
 ```
 
-### Keep state on a desk
+### Keep state in a box
 
 ```swift
 struct FeatureState: Sendable {
@@ -116,7 +116,7 @@ enum FeatureEvent: Sendable {
     case totalSet(Int)
 }
 
-let desk = Their.Desk<FeatureState, FeatureEvent>(FeatureState()) { state, event in
+let box = Their.Box<FeatureState, FeatureEvent>(FeatureState()) { state, event in
     switch event {
     case .totalSet(let total): state.total = total
     case .numberReceived(let value): state.total += value
@@ -124,8 +124,8 @@ let desk = Their.Desk<FeatureState, FeatureEvent>(FeatureState()) { state, event
     }
 }
 
-desk.send(.totalSet(10))
-desk.bind(numbers, id: "numbers") { event in
+box.send(.totalSet(10))
+box.bind(numbers, id: "numbers") { event in
     switch event {
     case .value(let value): return .numberReceived(value)
     case .failure(let failure): return .loadFailed(failure)
@@ -133,19 +133,19 @@ desk.bind(numbers, id: "numbers") { event in
     }
 }
 
-let cancel = desk.changes.subscribe { event in /* Consume snapshots. */ }
+let cancel = box.changes.subscribe { event in /* Consume snapshots. */ }
 cancel()                         // State and bindings keep running.
-let snapshot = desk.current      // Read-only value snapshot.
-desk.unbind("numbers")            // Stops this binding; keeps its last state.
+let snapshot = box.current      // Read-only value snapshot.
+box.unbind("numbers")            // Stops this binding; keeps its last state.
 ```
 
-`Desk<State, Event>` fixes one reducer at construction. Its only state transition path is `Event → reducer → State`: `send` queues a typed event, and `bind` maps a Job or Hub input into the same event type. Bindings never receive mutable state or install another reducer. A mapping can return `nil` to ignore an input without reduction or publication. A source terminal still retires its binding, whether it maps to an event or to `nil`.
+`Box<State, Event>` fixes one reducer at construction. Its only state transition path is `Event → reducer → State`: `send` queues a typed event, and `bind` maps a Job or Hub input into the same event type. Bindings never receive mutable state or install another reducer. A mapping can return `nil` to ignore an input without reduction or publication. A source terminal still retires its binding, whether it maps to an event or to `nil`.
 
-Binding another source under the same id cancels the old subscription and fences its queued events before reduction. An event already claimed by the reducer can finish. Retain Desk in the feature owner; it owns binding cancellations even when their returned handles are discarded. Use weak captures when a stored reducer, source mapping or observer refers back to that owner.
+Binding another source under the same id cancels the old subscription and fences its queued events before reduction. An event already claimed by the reducer can finish. Retain Box in the feature owner; it owns binding cancellations even when their returned handles are discarded. Use weak captures when a stored reducer, source mapping or observer refers back to that owner.
 
-Desk reuses `Hub.evolve` for FIFO reduction and keeps an internal observer until Desk release. The existing evolution still resets at the end of its own lifecycle. Desk adds state ownership rather than another reducer engine. Keep the reducer and source mappings pure and short; database writes and other effects belong in Jobs or application services. State must have value semantics: `Sendable` alone does not stop a caller from mutating shared reference storage.
+Box reuses `Hub.evolve` for FIFO reduction and keeps an internal observer until Box release. The existing evolution still resets at the end of its own lifecycle. Box adds state ownership rather than another reducer engine. Keep the reducer and source mappings pure and short; database writes and other effects belong in Jobs or application services. State must have value semantics: `Sendable` alone does not stop a caller from mutating shared reference storage.
 
-There is no implicit scheduler or actor confinement. An uncontended `send` drains inline; a concurrent or reentrant call can return while its event is queued. The current drainer processes events in queue admission order. Source mappings execute before admission and can run concurrently across bindings. `current` is updated before snapshot publication, but a concurrent send can make it newer than an observer's captured snapshot. Releasing Desk cancels bindings and finishes current observers; retaining `changes` does not keep Desk alive.
+There is no implicit scheduler or actor confinement. An uncontended `send` drains inline; a concurrent or reentrant call can return while its event is queued. The current drainer processes events in queue admission order. Source mappings execute before admission and can run concurrently across bindings. `current` is updated before snapshot publication, but a concurrent send can make it newer than an observer's captured snapshot. Releasing Box cancels bindings and finishes current observers; retaining `changes` does not keep Box alive.
 
 ### Streams and one-shot work
 
@@ -211,6 +211,26 @@ import TheirCoreTesting
 - Reports enter a FIFO queue that one caller drains at a time, so a terminal event never overtakes values reported before it.
 - Nothing hops threads. Callbacks run on the thread that reported the event, so hop to the main actor yourself before touching UI.
 - Subscribing twice to a `Their.Job`, or another incorrect use, is reported as `Their.Misuse`. The default handler stops the process.
+
+## 0.5.0
+
+Renames the state owner to `Their.Box<State, Event>`. `Their.Job` describes one
+owned lifecycle, `Their.Hub` shares a source, and `Their.Box` retains state and
+owns named source subscriptions. The fixed reducer, typed `send`, Job/Hub `bind`,
+`unbind`, read-only `current` and replaying `changes` keep their existing behavior.
+There is no scheduler or new effect policy.
+
+This is a breaking name change with no `Their.Desk` compatibility alias. For
+consumers of 0.3.0 or 0.4.0, replace `Their.Desk` with `Their.Box`; the generic
+parameters, initializer and methods are unchanged. Older releases keep their
+original API and names.
+
+Validated with Swift 6.3.3: **25 Box lifecycle scenarios**, all **474 tests in
+38 suites**, and a Release build. The public consumer target verifies both
+binding overloads without internal access. Compiler checks reject the old Desk
+name, arbitrary `update`, assignment to `current` or `changes`, wrong event types
+and per-binding mutable-state reducers. All runtime scenarios retain their
+`Their.stress` coverage.
 
 ## 0.4.0
 

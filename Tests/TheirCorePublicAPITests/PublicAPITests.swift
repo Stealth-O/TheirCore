@@ -9,6 +9,32 @@ import TheirCoreTesting
 @Suite
 struct PublicAPITests {
 
+    @Test func boxOwnsStateAndBothSourceKindsFromOutsideThePackage() async throws {
+        try await Their.stress {
+            let box = Their.Box<[Int], Int>([]) { state, event in state.append(event) }
+            let job = Their.TestJobDriver<Int, LoadError>()
+            let hub = Their.TestHubDriver<Int, LoadError>()
+            box.send(1)
+            box.bind(job.job, id: "save") { event in
+                if case .value(let value) = event { return value }
+                return nil
+            }
+            box.bind(hub.hub, id: "live") { event in
+                if case .value(let value) = event { return value }
+                return nil
+            }
+            job.emit(value: 2)
+            job.emitFinished()
+            hub.emit(value: 3)
+            box.unbind("live")
+            #expect(box.current == [1, 2, 3])
+            let events = Their.TestEventRecorder<Their.HubEvent<[Int], Never>>()
+            let cancel = box.changes.subscribe(events.append)
+            #expect(events.events == [.value([1, 2, 3])])
+            cancel()
+        }
+    }
+
     @Test func consumerTypesKeepTheirOwnNames() async throws {
         try await Their.stress {
             let local = Job(title: "mine")
@@ -21,32 +47,6 @@ struct PublicAPITests {
             let cancel = job.subscribe(events.append(_:))
             try await events.waitForEventCount(2)
             #expect(events.events == [.value("mine"), .finished])
-            cancel()
-        }
-    }
-
-    @Test func deskOwnsStateAndBothSourceKindsFromOutsideThePackage() async throws {
-        try await Their.stress {
-            let desk = Their.Desk<[Int], Int>([]) { state, event in state.append(event) }
-            let job = Their.TestJobDriver<Int, LoadError>()
-            let hub = Their.TestHubDriver<Int, LoadError>()
-            desk.send(1)
-            desk.bind(job.job, id: "save") { event in
-                if case .value(let value) = event { return value }
-                return nil
-            }
-            desk.bind(hub.hub, id: "live") { event in
-                if case .value(let value) = event { return value }
-                return nil
-            }
-            job.emit(value: 2)
-            job.emitFinished()
-            hub.emit(value: 3)
-            desk.unbind("live")
-            #expect(desk.current == [1, 2, 3])
-            let events = Their.TestEventRecorder<Their.HubEvent<[Int], Never>>()
-            let cancel = desk.changes.subscribe(events.append)
-            #expect(events.events == [.value([1, 2, 3])])
             cancel()
         }
     }

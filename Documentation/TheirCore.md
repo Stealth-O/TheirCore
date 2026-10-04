@@ -1,6 +1,6 @@
 # TheirCore
 
-TheirCore holds the lifecycle and concurrency primitives: `Their.Job`, `Their.Hub`, `Their.Desk`, the evolution operators, the stream adapters, `Their.Lock` and a few ownership helpers. It is small on purpose, and it is meant to show the engineering depth expected from any stateful service built on top of it.
+TheirCore holds the lifecycle and concurrency primitives: `Their.Job`, `Their.Hub`, `Their.Box`, the evolution operators, the stream adapters, `Their.Lock` and a few ownership helpers. It is small on purpose, and it is meant to show the engineering depth expected from any stateful service built on top of it.
 
 Passing tests is not the goal by itself. The goal is to make every important behavior explicit: state, lifecycle, resource ownership, observable events, ignored branches and terminal transitions.
 
@@ -135,13 +135,13 @@ already executing when cancellation wins may finish, but cannot replace that
 outcome. This adapter preserves Job's single-subscriber misuse rules; every
 independent await needs a fresh Job, just as every independent subscription does.
 
-## Desk Model
+## Box Model
 
-`Their.Desk<State, Event>` owns a value snapshot and named source subscriptions for its own lifetime. One `@Sendable (inout State, Event) -> Void` reducer is required at construction and cannot be replaced. Its implementation and contract live in `Sources/TheirCore/Desk.swift`; `DeskTests` covers the lifecycle and `PublicAPITests` exercises it without internal access.
+`Their.Box<State, Event>` owns a value snapshot and named source subscriptions for its own lifetime. One `@Sendable (inout State, Event) -> Void` reducer is required at construction and cannot be replaced. Its implementation and contract live in `Sources/TheirCore/Box.swift`; `BoxTests` covers the lifecycle and `PublicAPITests` exercises it without internal access.
 
 The state transition boundary is `Event → fixed reducer → State`. `send(Event)` and source mappings enter the same private input Hub → existing `evolve` → snapshot publication → `shareLatest` path. Queued inputs contain event data and optional binding identity, never another state-mutating closure. `bind` only translates a Job/Hub input to `Event?`; it has no mutable State argument. Returning `nil` skips reduction and publication. Every accepted event invokes the fixed reducer exactly once and emits its snapshot, even when the state is unchanged. Initial publication and replay bypass the reducer.
 
-A private anchor keeps this path subscribed until Desk release, so detaching all external observers does not reset state or stop bound sources. `changes` is the snapshot output, and `current` is its read-only retained value. `current` is updated before a new snapshot enters the observation hub; concurrent sends can make it newer than a callback's value. State must have value semantics. Swift's `Sendable` constraint does not enforce reducer purity or prevent aliases to shared mutable reference storage.
+A private anchor keeps this path subscribed until Box release, so detaching all external observers does not reset state or stop bound sources. `changes` is the snapshot output, and `current` is its read-only retained value. `current` is updated before a new snapshot enters the observation hub; concurrent sends can make it newer than a callback's value. State must have value semantics. Swift's `Sendable` constraint does not enforce reducer purity or prevent aliases to shared mutable reference storage.
 
 | Operation or event | State and ownership |
 | --- | --- |
@@ -154,20 +154,27 @@ A private anchor keeps this path subscribed until Desk release, so detaching all
 | Source terminal event | Retire its cancel handle even if mapped to nil; preserve its generation so already queued events can still reduce |
 | `unbind`, returned cancel or replacement | Invalidate old queued/future events; cancel the retired handle outside locks; do not change state directly |
 | Cancel from an old binding | Ignore it if another generation already owns the id |
-| Desk release | Close the registry, cancel sources, finish observers and release the anchor |
-| Subscribe to retained `changes` after Desk release | Finish immediately; do not revive initial state |
+| Box release | Close the registry, cancel sources, finish observers and release the anchor |
+| Subscribe to retained `changes` after Box release | Finish immediately; do not revive initial state |
 
-The per-id generation fence is checked before mapping starts and again when its queued event is claimed for reduction. The latter check suppresses stale events already waiting behind another event, including values queued before a source finished or returned by a mapping that was in flight during replacement. An event that passed the reduction fence before cancellation may complete. Starting a subscription is similarly a claimed action: replacement during its start cancels the handle as soon as it is returned. Desk cannot undo IO that has already committed. Domain transactions and checks immediately before irreversible IO stay in the application.
+The per-id generation fence is checked before mapping starts and again when its queued event is claimed for reduction. The latter check suppresses stale events already waiting behind another event, including values queued before a source finished or returned by a mapping that was in flight during replacement. An event that passed the reduction fence before cancellation may complete. Starting a subscription is similarly a claimed action: replacement during its start cancels the handle as soon as it is returned. Box cannot undo IO that has already committed. Domain transactions and checks immediately before irreversible IO stay in the application.
 
-Binding ids should be stable feature names, such as `"reload"` or `"submission"`. Small generation tombstones remain until Desk release so a cancel from a completed binding can still fence its queued results. Do not allocate a fresh id per event. Dropping a returned cancel leaves the Desk-owned binding active. Binding cancellation controls source ownership; represent a domain cancellation state change with an explicit Event and the fixed reducer.
+Binding ids should be stable feature names, such as `"reload"` or `"submission"`. Small generation tombstones remain until Box release so a cancel from a completed binding can still fence its queued results. Do not allocate a fresh id per event. Dropping a returned cancel leaves the Box-owned binding active. Binding cancellation controls source ownership; represent a domain cancellation state change with an explicit Event and the fixed reducer.
 
-Source mapping captures retire with their subscriptions; an already running callback can retain them until it returns. A queued typed event does not retain its mapping closure, but its own payload stays alive until processing or queue cleanup. The fixed reducer belongs to the evolution pipeline, which can be retained through `changes`. Use weak captures when the reducer, a mapping or an observer refers back to its Desk or feature owner; caller-created strong ownership cycles remain the caller's responsibility.
+Source mapping captures retire with their subscriptions; an already running callback can retain them until it returns. A queued typed event does not retain its mapping closure, but its own payload stays alive until processing or queue cleanup. The fixed reducer belongs to the evolution pipeline, which can be retained through `changes`. Use weak captures when the reducer, a mapping or an observer refers back to its Box or feature owner; caller-created strong ownership cycles remain the caller's responsibility.
 
-There is no actor confinement or implicit scheduler. Reduction is serialized by `evolve` on the current drainer's thread; uncontended sends drain inline, while concurrent and reentrant sends may return before their queued events apply. FIFO means admission order at the private input Hub, not a total wall-clock order across producers. Source mappings execute before admission and can run concurrently across bindings. Keep both the reducer and mappings pure and short. No user reducer, mapping, sink, source cancel or retired capture destructor runs under a Desk lock. Desk introduces no new `@unchecked Sendable` declarations and leaves the Job/Hub/evolution contracts intact.
+There is no actor confinement or implicit scheduler. Reduction is serialized by `evolve` on the current drainer's thread; uncontended sends drain inline, while concurrent and reentrant sends may return before their queued events apply. FIFO means admission order at the private input Hub, not a total wall-clock order across producers. Source mappings execute before admission and can run concurrently across bindings. Keep both the reducer and mappings pure and short. No user reducer, mapping, sink, source cancel or retired capture destructor runs under a Box lock. Box introduces no new `@unchecked Sendable` declarations and leaves the Job/Hub/evolution contracts intact.
 
-### Migrating Desk from 0.2.0
+### Migrating from Desk 0.3.0 or 0.4.0
 
-Declare the feature's Event type and move all state transitions into the one constructor reducer. Replace `update { state in ... }` with `send(event)`. Change each `bind` closure from `(inout State, SourceEvent) -> Void` to `(SourceEvent) -> Event?`; explicitly map terminal inputs if they should change domain state, otherwise return nil. The public `update` and per-binding mutable-state signatures have been removed. `current` remains read-only and `changes` remains a snapshot Hub. The existing source evolution operators are unchanged and cannot mutate a Desk's owned state.
+TheirCore 0.5.0 renames `Their.Desk<State, Event>` to `Their.Box<State, Event>`.
+Replace the type name and update the exact package version. The initializer,
+fixed reducer, methods and lifecycle contract are unchanged. There is no `Desk`
+type alias, so migrated consumers use one name for the state owner.
+
+### Migrating from Desk 0.2.0
+
+Declare the feature's Event type and move all state transitions into the one constructor reducer. Replace `update { state in ... }` with `send(event)`. Change each `bind` closure from `(inout State, SourceEvent) -> Void` to `(SourceEvent) -> Event?`; explicitly map terminal inputs if they should change domain state, otherwise return nil. The public `update` and per-binding mutable-state signatures have been removed. `current` remains read-only and `changes` remains a snapshot Hub. The existing source evolution operators are unchanged and cannot mutate a Box's owned state.
 
 ## Execution and Threading
 
@@ -265,7 +272,7 @@ A scenario that holds a drainer inside a sink or transform, for example with a `
 
 ### Lifetime Cleanup Contract
 
-The cleanup paths covered here are Desk snapshots and bindings, subscription pins and sink slots, `JobEngine` input cleanup, job evolution, hub evolution, merge, weak-cache pruning and replacement of logging outputs and diagnostic hooks. They detach retired callbacks, state and discarded inputs under the corresponding lock, then release those references after unlocking, so destructors may synchronously re-enter cancellation or lookup. Releasing the last facade reference of a job or hub subscription pin must not run upstream teardown under the pin lock.
+The cleanup paths covered here are Box snapshots and bindings, subscription pins and sink slots, `JobEngine` input cleanup, job evolution, hub evolution, merge, weak-cache pruning and replacement of logging outputs and diagnostic hooks. They detach retired callbacks, state and discarded inputs under the corresponding lock, then release those references after unlocking, so destructors may synchronously re-enter cancellation or lookup. Releasing the last facade reference of a job or hub subscription pin must not run upstream teardown under the pin lock.
 
 A job's sink slot moves through `open`, `subscribed` and `closed`. Taking or clearing it closes the slot permanently before root-engine teardown. A destructor may attempt to subscribe again through a nonfatal misuse handler, but the rejected subscription never acquires a sink.
 
@@ -277,7 +284,7 @@ A hub subscription drops its sink reference on cancel, finish or failure. Keepin
 
 Regression coverage:
 
-- `DeskTests`: state across UI lifecycles, generation fencing of queued reducers, synchronous terminal and late-start cleanup, source cancellation reentry, reducer capture release, snapshot destructor reentry and owner release with retained external handles.
+- `BoxTests`: state across UI lifecycles, generation fencing of queued reducers, synchronous terminal and late-start cleanup, source cancellation reentry, reducer capture release, snapshot destructor reentry and owner release with retained external handles.
 - `JobSubscriptionLifetimeTests` and `HubSubscriptionLifetimeTests`: the real public cancel and pin paths, weak task-local lock probes, and upstream teardown re-entering the same cancel.
 - `JobEvolutionLifetimeTests`, `HubEvolutionLifetimeTests` and `JobMergeLifetimeTests`: destructors of state, replay values, sinks and discarded inputs across cancel, finish, failure, transform failure, unsubscribing a subscriber that is not the last, replacement and reentrant cleanup. DEBUG-only construction seams use the actual private state machines without exposing public facade state.
 - `HubCaptureLifetimeTests` and `HubEngineSubscriptionTests`: captures released while the cancel handle remains alive, terminal cleanup, callback-driven cancellation, and captures retained only until an in-flight callback returns.
@@ -299,7 +306,7 @@ Every test already runs its scenario many times concurrently through `Their.stre
 
 ## Known Gaps and Missing Operators
 
-`Their.Job` and `Their.Hub` cover subscriber cardinality: one subscriber or many. `Their.Desk` owns state and bindings across observation lifecycles, using the existing Hub evolution. The remaining gaps are operators, in priority order:
+`Their.Job` and `Their.Hub` cover subscriber cardinality: one subscriber or many. `Their.Box` owns state and bindings across observation lifecycles, using the existing Hub evolution. The remaining gaps are operators, in priority order:
 
 - Multi-upstream readiness operators such as `combineLatest`, `withLatestFrom` or `zip`. `Their.Job.merge` covers the union of same-typed event streams and should be paired with `evolve` for reducer-owned state. Readiness policies such as "wait for the latest value of every upstream", "sample another upstream" or "pair values by position" are still absent. Add them as operators with full lifecycle tests when a second real case needs that specific policy, not as local callback bags.
 - Materialization with `materialize()` and `dematerialize()`, for reducer-owned terminal policy such as "the first finish of an important source terminates the whole merged pipeline" or errors as data from sources you do not own. Add the pair on top of `.finished`: `materialize` duplicates the upstream terminal event as a final data marker and then genuinely finishes, and `dematerialize` turns marker output back into a real terminal event and cancels its upstream, which cascades through `merge`. Keep `evolve` untouched: a "last word" or flush belongs to the materialized output alphabet, not to a second transform parameter.
